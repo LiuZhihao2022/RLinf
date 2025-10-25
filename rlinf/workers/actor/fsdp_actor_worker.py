@@ -790,6 +790,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+        if self.cfg.actor.get(
+            "critic_warmup", False
+        ) and self.model.global_step < self.cfg.actor.get("critic_warmup_steps", 5):
+            warmup_stage = True
+        else:
+            warmup_stage = False
         for _ in range(update_epoch):
             rollout_dataloader_iter = get_iterator_k_split(
                 self.rollout_batch,
@@ -865,6 +871,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "loss_mask": loss_mask,
                         "loss_mask_sum": loss_mask_sum,
                         "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                        "warmup_stage": warmup_stage,
                     }
                     kwargs = preprocess_loss_inputs(**kwargs)
 
