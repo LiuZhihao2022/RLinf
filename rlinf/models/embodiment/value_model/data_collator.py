@@ -102,6 +102,7 @@ class ValueDataCollator(DataCollatorMixin):
         images_batch = []
         image_masks_batch = []
         prompts = []
+        states_list: list[Any] = []
         actions_list = []
         action_mask_list = []
 
@@ -120,6 +121,7 @@ class ValueDataCollator(DataCollatorMixin):
             images_batch.append(ex[image_key])
             image_masks_batch.append(ex.get(mask_key, {}))
             prompts.append(ex["prompt"])
+            states_list.append(ex.get("state"))
 
             actions = ex.get("actions")
             actions_list.append(actions)
@@ -136,6 +138,26 @@ class ValueDataCollator(DataCollatorMixin):
         images = stack_tensors(images_batch)
         image_masks = stack_tensors(image_masks_batch)
 
+        # Build a padded state batch only when the dataset actually threaded
+        # state through. Samples without state get a zero row (→ middle bin
+        # 128 after clip+digitize), matching the "padded zero dim" fallback
+        # used when state_dim < max_state_dim.
+        state_batch: Any = None
+        any_state = any(s is not None for s in states_list)
+        if any_state:
+            template = next((s for s in states_list if s is not None), None)
+            state_dim = int(template.shape[0])
+            state_batch = np.stack(
+                [
+                    (
+                        np.asarray(s, dtype=np.float32).reshape(-1)
+                        if s is not None
+                        else np.zeros(state_dim, dtype=np.float32)
+                    )
+                    for s in states_list
+                ]
+            )
+
         processed_img = self.processor.image_processor(
             images=images,
             image_masks=image_masks,
@@ -145,6 +167,7 @@ class ValueDataCollator(DataCollatorMixin):
 
         processed_txt = self.processor.process_text(
             prompts=prompts,
+            states=state_batch,
             max_length=self.max_length,
             return_tensors="pt",
         )
@@ -159,6 +182,32 @@ class ValueDataCollator(DataCollatorMixin):
             for i in range(min(len(prompts), 4)):
                 logger.info(
                     "  [%d] prompt: %s", i, prompts[i] if prompts[i] else "None"
+                )
+            if state_batch is not None:
+                logger.info(
+                    "[Collator Verification] state batch: shape=%s min=%.4f "
+                    "max=%.4f mean=%.4f",
+                    tuple(state_batch.shape),
+                    float(state_batch.min()),
+                    float(state_batch.max()),
+                    float(state_batch.mean()),
+                )
+                try:
+                    decoded = self.processor.tokenizer.decode(
+                        lang_tokens[0].tolist(), skip_special_tokens=False
+                    )
+                    logger.info(
+                        "[Collator Verification] first decoded prompt: %s", decoded
+                    )
+                except Exception as exc:  # noqa: BLE001 — log-only best-effort
+                    logger.info(
+                        "[Collator Verification] could not decode first prompt: %s",
+                        exc,
+                    )
+            else:
+                logger.info(
+                    "[Collator Verification] no state in batch "
+                    "(dataset did not emit 'state' key)"
                 )
 
         action_mask = torch.tensor(action_mask_list, dtype=torch.float32)

@@ -1,0 +1,41 @@
+model_type: "value_model_evorl"
+
+precision: null
+is_lora: false
+
+# Backbones (local paths). The Pistar06ValueProcessor uses tokenizer_path;
+# Pistar06Model loads vision/language backbones via vision_repo_id /
+# language_repo_id (these can also be HF repo ids for online environments).
+vision_repo_id: /path/to/siglip-so400m-patch14-384
+language_repo_id: /path/to/gemma-3-270m
+tokenizer_path: /path/to/gemma-3-270m
+
+# Architecture
+fusion_hidden_dim: 512
+dropout: 0.1
+
+# Distributional value head (same semantics as value_model's num_bins/v_min/v_max)
+num_bins: 201
+v_min: -1.0
+v_max: 0.0
+
+# Runtime
+freeze_vision_encoder: false
+freeze_language_model: false
+use_gradient_checkpointing: false
+
+# Interface compat (consumed by ValueDataset / Pistar06ValueProcessor)
+action_dim: 32
+action_horizon: 50
+max_token_len: 200
+
+# State-in-prompt (aligns with external Evo-RL reference). When true the
+# processor builds "Task: {task}, State: {b0 b1 ... bN}\nValue: " where each
+# bi is the integer bucket index of a state dim. Requires that
+# data.norm_stats_dir is set so state reaches the processor already in [-1, 1].
+include_state_in_prompt: true
+max_state_dim: 32
+state_discretization_bins: 256
+
+# Optional: previously trained Pistar06ValueCriticModel checkpoint to resume.
+# model_path: "/path/to/checkpoint"

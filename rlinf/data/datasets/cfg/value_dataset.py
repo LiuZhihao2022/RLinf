@@ -104,14 +104,14 @@ class ValueDataset(Dataset):
         episode_percentage: Optional[float] = None,
         shuffle_episodes: bool = False,
         episode_seed: int = 42,
+        norm_stats_dir: Optional[str] = None,
+        asset_id: Optional[str] = None,
         **kwargs,  # accept unused params (gamma, split, etc.)
     ):
         _known_unused = {
             "gamma",
             "split",
             "repo_id",
-            "norm_stats_dir",
-            "asset_id",
             "extra_delta_transform",
             "action_norm_skip_dims",
         }
@@ -178,12 +178,46 @@ class ValueDataset(Dataset):
                 for i in range(idx["from"][ep].item(), idx["to"][ep].item())
             ]
 
+        # Optionally load quantile norm_stats so training-time state matches
+        # inference-time normalization. Without this, state fed into the
+        # Pistar06 state-in-prompt pipeline is raw joint space and would clip
+        # catastrophically in np.digitize([-1, 1], ...). We reuse the same
+        # helper as modeling_critic.from_checkpoint to guarantee parity.
+        self._norm_stats = None
+        if norm_stats_dir is not None:
+            from rlinf.models.embodiment.value_model.checkpoint_utils import (
+                load_norm_stats,
+            )
+
+            resolved_asset_id = asset_id or robot_type.lower()
+            try:
+                self._norm_stats = load_norm_stats(
+                    Path(norm_stats_dir), asset_id=resolved_asset_id
+                )
+                logger.info(
+                    "Loaded norm_stats from %s for asset_id=%s: keys=%s",
+                    norm_stats_dir,
+                    resolved_asset_id,
+                    sorted(self._norm_stats.keys()),
+                )
+            except FileNotFoundError as e:
+                raise FileNotFoundError(
+                    f"ValueDataset was given norm_stats_dir={norm_stats_dir!r} "
+                    f"asset_id={resolved_asset_id!r} but no norm_stats.json was "
+                    f"found. Inference-time normalization requires these stats; "
+                    f"without them state will not be in [-1, 1] and "
+                    f"include_state_in_prompt will produce degenerate tokens. "
+                    f"Either fix the path or drop norm_stats_dir from the data "
+                    f"config and leave include_state_in_prompt disabled."
+                ) from e
+
         # Transform pipeline (repack → data → model)
         self._transform = self._build_transform(
             robot_type=robot_type,
             model_type=model_type,
             action_dim=action_dim or 32,
             default_prompt=default_prompt,
+            norm_stats=self._norm_stats,
         )
 
         # Task descriptions for prompt injection
@@ -206,8 +240,16 @@ class ValueDataset(Dataset):
         logger.info(f"ValueDataset: {dataset_path}, {min(n, max_samples or n)} samples")
 
     @staticmethod
-    def _build_transform(robot_type, model_type, action_dim, default_prompt):
-        """Build transform pipeline using openpi policies and transforms."""
+    def _build_transform(
+        robot_type, model_type, action_dim, default_prompt, norm_stats=None
+    ):
+        """Build transform pipeline using openpi policies and transforms.
+
+        When ``norm_stats`` is provided, a quantile ``Normalize`` step is
+        inserted between ``InjectDefaultPrompt`` and ``PadStatesAndActions``,
+        matching the inference-side ordering in ``build_input_transforms``
+        (see ``value_model/checkpoint_utils.py``).
+        """
         model_type_lower = model_type.lower()
         model_type_enum = _MODEL_TYPE_MAP[model_type_lower]
         robot = robot_type.lower()
@@ -240,6 +282,10 @@ class ValueDataset(Dataset):
         #    value model handles tokenization via ValueProcessor in the
         #    collator, and image resize via ValueImageProcessor)
         transforms_list.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
+        if norm_stats is not None:
+            transforms_list.append(
+                _openpi_transforms.Normalize(norm_stats, use_quantiles=True)
+            )
         transforms_list.append(_openpi_transforms.PadStatesAndActions(action_dim))
 
         return _openpi_transforms.compose(transforms_list)
@@ -313,4 +359,17 @@ class ValueDataset(Dataset):
         }
         if isinstance(masks, dict) and masks:
             result["image_masks"] = masks
+
+        # Thread per-frame state through so the collator can forward it into
+        # Pistar06ValueProcessor for state-in-prompt tokenization. The state has
+        # already been passed through LiberoInputs/FrankaEEInputs + optional
+        # Normalize(quantile) + PadStatesAndActions by self._transform above,
+        # so it is in [-1, 1] iff norm_stats_dir was provided.
+        state = sample.get("state")
+        if state is not None:
+            if isinstance(state, torch.Tensor):
+                state_np = state.detach().cpu().numpy()
+            else:
+                state_np = np.asarray(state)
+            result["state"] = state_np.astype(np.float32, copy=False).reshape(-1)
         return result

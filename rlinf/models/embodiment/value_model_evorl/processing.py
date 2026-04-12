@@ -12,20 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-Image and text processors for value model.
+"""Image and text processors for the Pistar06 evorl value model.
 
-Contains:
-- ValueImageProcessor: HuggingFace-style image processor handling resize, padding,
-  augmentation, and multi-camera views.
-- normalize_image_to_model_format: Utility to convert arbitrary image tensors
-  to BCHW [-1, 1] float format.
-- ValueProcessor: Processor combining image preprocessing and text tokenization.
+Standalone module — does NOT import anything from
+``rlinf.models.embodiment.value_model.processing``.
 
-Text template: ``Task: {prompt}.``
-
-All prefix tokens use bidirectional attention. The value model's expert head
-predicts the value via a [CLS] token appended at the model level, not here.
+Key differences from the value_model processor:
+    * Native 384x384 image resolution (not 224x224 + interpolate)
+    * Outputs raw [0, 1] BCHW float images (not [-1, 1])
+      so the downstream Pistar06Model can apply its own SigLIP-style
+      mean/std normalization in ``_preprocess_images``.
 """
 
 import logging
@@ -53,7 +49,8 @@ def resize_with_pad(
 ) -> torch.Tensor:
     """Resize an image to target size without distortion by padding with black.
 
-    If the image is float32, it must be in the range [-1, 1].
+    For float images the [0, 1] range is preserved (padding value 0.0).
+    For uint8 images padding value is 0.
 
     Args:
         images: Tensor of shape [*b, h, w, c] or [*b, c, h, w]
@@ -62,7 +59,7 @@ def resize_with_pad(
         mode: Interpolation mode ('bilinear', 'nearest', etc.)
 
     Returns:
-        Resized and padded tensor with same shape format as input
+        Resized and padded tensor with same shape format as input.
     """
     added_batch_dim = False
 
@@ -94,7 +91,8 @@ def resize_with_pad(
     if images.dtype == torch.uint8:
         resized_images = torch.round(resized_images).clamp(0, 255).to(torch.uint8)
     elif images.dtype == torch.float32:
-        resized_images = resized_images.clamp(-1.0, 1.0)
+        # Pistar06 processor outputs [0, 1] floats; clamp accordingly.
+        resized_images = resized_images.clamp(0.0, 1.0)
     else:
         raise ValueError(f"Unsupported image dtype: {images.dtype}")
 
@@ -103,7 +101,7 @@ def resize_with_pad(
     pad_w0, remainder_w = divmod(width - resized_width, 2)
     pad_w1 = pad_w0 + remainder_w
 
-    constant_value = 0 if images.dtype == torch.uint8 else -1.0
+    constant_value = 0 if images.dtype == torch.uint8 else 0.0
     padded_images = F.pad(
         resized_images,
         (pad_w0, pad_w1, pad_h0, pad_h1),
@@ -125,26 +123,21 @@ IMAGE_KEYS = (
     "right_wrist_0_rgb",
 )
 
-IMAGE_RESOLUTION = (224, 224)
+# Native Pistar06 vision-encoder resolution (siglip-so400m-patch14-384).
+IMAGE_RESOLUTION = (384, 384)
 
 
-def normalize_image_to_model_format(
+def normalize_image_to_pistar06_format(
     img: torch.Tensor,
     device: torch.device = None,
     dtype: torch.dtype = None,
 ) -> torch.Tensor:
-    """
-    Normalize a single image to model format (verified standard from policy._prepare_observation).
+    """Convert any image format to BCHW float in [0, 1] range.
 
-    Converts any image format to BCHW [-1, 1] float tensor.
-
-    Args:
-        img: Input image tensor (CHW, HWC, BCHW, or BHWC format; uint8 or float)
-        device: Target device (optional)
-        dtype: Target dtype (optional, e.g., torch.bfloat16)
-
-    Returns:
-        Tensor in BCHW format, normalized to [-1, 1], with optional dtype conversion
+    Pistar06 expects raw [0, 1] floats; the model itself applies SigLIP
+    mean/std normalization internally. This helper is the public counterpart
+    to ``ValueProcessor.normalize_image_to_model_format`` but with target
+    range [0, 1] instead of [-1, 1].
     """
     if device is not None:
         img = img.to(device)
@@ -161,33 +154,24 @@ def normalize_image_to_model_format(
 
     img = img.float()
 
-    if is_chw:
-        if img.max() > 1.0:
-            img = img / 255.0 * 2.0 - 1.0
-        elif img.min() >= 0.0 and img.max() <= 1.0:
-            img = img * 2.0 - 1.0
-    else:
+    if not is_chw:
         img = img.permute(0, 3, 1, 2)  # BHWC -> BCHW
-        if img.max() > 1.0:
-            img = img / 255.0 * 2.0 - 1.0
-        elif img.min() >= 0.0 and img.max() <= 1.0:
-            img = img * 2.0 - 1.0
+
+    if img.max() > 1.0:
+        img = img / 255.0
+    img = img.clamp(0.0, 1.0)
 
     if dtype is not None:
         img = img.to(dtype)
-
     return img
 
 
-class ValueImageProcessor(ImageProcessingMixin):
-    """
-    Value model image processor that replicates OpenPI's preprocessing logic.
+class Pistar06ValueImageProcessor(ImageProcessingMixin):
+    """Pistar06 image processor.
 
-    Implements the exact image preprocessing pipeline from OpenPI:
-    - Resize with padding to maintain aspect ratio
-    - Training augmentations: crop, rotation, color jitter
-    - Images kept in [-1, 1] range
-    - Handles multiple camera views
+    Resizes raw multi-camera input to native 384x384, outputs BCHW [0, 1]
+    float tensors. The downstream Pistar06Model handles SigLIP normalization
+    internally.
     """
 
     model_input_names: ClassVar[list[str]] = ["pixel_values", "image_masks"]
@@ -209,24 +193,14 @@ class ValueImageProcessor(ImageProcessingMixin):
     def apply_augmentations(
         self, image: torch.Tensor, is_wrist_camera: bool = False
     ) -> torch.Tensor:
+        """Apply OpenPI-style augmentations.
+
+        Input/output range: [0, 1] BHWC float (no [-1, 1] conversions —
+        Pistar06 keeps [0, 1] all the way through the processor).
         """
-        Apply OpenPI-style augmentations to the image.
-
-        Args:
-            image: Input image tensor in BHWC format, range [-1, 1]
-            is_wrist_camera: Whether this is a wrist camera (affects augmentation)
-
-        Returns:
-            Augmented image tensor in BHWC format, range [-1, 1]
-        """
-        # Convert from [-1, 1] to [0, 1] for PyTorch augmentations
-        image = image / 2.0 + 0.5
-
         if not is_wrist_camera:
-            # Geometric augmentations for non-wrist cameras
             height, width = image.shape[1:3]
 
-            # Random crop and resize (95% crop scale like OpenPI)
             crop_height = int(height * 0.95)
             crop_width = int(width * 0.95)
 
@@ -243,66 +217,50 @@ class ValueImageProcessor(ImageProcessingMixin):
                 ]
 
             image = F.interpolate(
-                image.permute(0, 3, 1, 2),  # [b, h, w, c] -> [b, c, h, w]
+                image.permute(0, 3, 1, 2),
                 size=(height, width),
                 mode="bilinear",
                 align_corners=False,
-            ).permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
+            ).permute(0, 2, 3, 1)
 
-            # Random rotation (small angles, -5 to 5 degrees like OpenPI)
             angle = torch.rand(1, device=image.device) * 10 - 5
             if torch.abs(angle) > 0.1:
-                # Convert to radians
                 angle_rad = angle * torch.pi / 180.0
-
-                # Create rotation matrix
                 cos_a = torch.cos(angle_rad)
                 sin_a = torch.sin(angle_rad)
 
-                # Apply rotation using grid_sample
                 grid_x = torch.linspace(-1, 1, width, device=image.device)
                 grid_y = torch.linspace(-1, 1, height, device=image.device)
 
-                # Create meshgrid
                 grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
-
-                # Expand to batch dimension
                 grid_x = grid_x.unsqueeze(0).expand(image.shape[0], -1, -1)
                 grid_y = grid_y.unsqueeze(0).expand(image.shape[0], -1, -1)
 
-                # Apply rotation transformation
                 grid_x_rot = grid_x * cos_a - grid_y * sin_a
                 grid_y_rot = grid_x * sin_a + grid_y * cos_a
-
-                # Stack and reshape for grid_sample
                 grid = torch.stack([grid_x_rot, grid_y_rot], dim=-1)
 
                 image = F.grid_sample(
-                    image.permute(0, 3, 1, 2),  # [b, h, w, c] -> [b, c, h, w]
+                    image.permute(0, 3, 1, 2),
                     grid,
                     mode="bilinear",
                     padding_mode="zeros",
                     align_corners=False,
-                ).permute(0, 2, 3, 1)  # [b, c, h, w] -> [b, h, w, c]
+                ).permute(0, 2, 3, 1)
 
-        # Color augmentations for all cameras
-        # Random brightness (0.7 to 1.3 like OpenPI)
+        # Color augmentations (apply to all cameras)
         brightness_factor = 0.7 + torch.rand(1, device=image.device) * 0.6
         image = image * brightness_factor
 
-        # Random contrast (0.6 to 1.4 like OpenPI)
         contrast_factor = 0.6 + torch.rand(1, device=image.device) * 0.8
         mean = image.mean(dim=[1, 2, 3], keepdim=True)
         image = (image - mean) * contrast_factor + mean
 
-        # Random saturation (0.5 to 1.5 like OpenPI)
         saturation_factor = 0.5 + torch.rand(1, device=image.device) * 1.0
         gray = image.mean(dim=-1, keepdim=True)
         image = gray + (image - gray) * saturation_factor
 
-        image = torch.clamp(image, 0, 1)
-        image = image * 2.0 - 1.0
-
+        image = torch.clamp(image, 0.0, 1.0)
         return image
 
     def process_images(
@@ -311,21 +269,11 @@ class ValueImageProcessor(ImageProcessingMixin):
         image_masks_dict: Optional[dict[str, torch.Tensor]] = None,
         train: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """
-        Process a batch of images efficiently.
+        """Process a batch of images at native 384x384 resolution.
 
-        Matches policy._prepare_observation behavior (the verified standard):
-        - Always outputs BCHW format
-        - Normalizes to [-1, 1] float
-
-        Args:
-            images_dict: Dict with OpenPI camera keys, each tensor [B, C, H, W] or [B, H, W, C]
-            image_masks_dict: Optional dict of image masks
-            train: Whether to apply training augmentations
-
-        Returns:
-            Tuple of (processed_images_dict, processed_masks_dict)
-            Images are returned in BCHW format, [-1, 1] float for model consumption.
+        Output:
+            (processed_images_dict, processed_masks_dict)
+            Images are in BCHW format, [0, 1] float.
         """
         out_images = {}
         out_masks = {}
@@ -341,7 +289,7 @@ class ValueImageProcessor(ImageProcessingMixin):
         for key in self.image_keys:
             image = images_dict.get(key)
 
-            # Missing keys get placeholder zero images with mask=False
+            # Missing keys get placeholder zero images with mask=False.
             if image is None:
                 if batch_size is not None:
                     h, w = self.image_size
@@ -357,31 +305,23 @@ class ValueImageProcessor(ImageProcessingMixin):
             is_wrist = "wrist" in key
 
             is_bchw = image.shape[1] == 3
-
             if is_bchw:
                 image = image.permute(0, 2, 3, 1)  # BCHW -> BHWC
 
-            # tuple() needed because self.image_size may be a list after deserialization
             if self.do_resize and tuple(image.shape[1:3]) != tuple(self.image_size):
                 image = resize_with_pad(image, self.image_size[1], self.image_size[0])
-                # Ensure 4D output (resize_with_pad may squeeze batch dim)
                 if image.dim() == 3:
                     image = image.unsqueeze(0)
 
-            # Normalize to [-1, 1] to match policy._prepare_observation
+            # Normalize to [0, 1] (Pistar06Model handles SigLIP mean/std internally)
             image = image.float()
             if image.max() > 1.0:
-                # uint8 [0, 255] -> float32 [-1, 1]
-                image = image / 255.0 * 2.0 - 1.0
-            elif image.min() >= 0.0 and image.max() <= 1.0:
-                # float [0, 1] -> float32 [-1, 1]
-                image = image * 2.0 - 1.0
-            # else: already in [-1, 1], leave as is
+                image = image / 255.0
+            image = image.clamp(0.0, 1.0)
 
             if train and self.do_augment:
                 image = self.apply_augmentations(image, is_wrist_camera=is_wrist)
 
-            # Output BCHW to match policy._prepare_observation
             image = image.permute(0, 3, 1, 2)  # BHWC -> BCHW
 
             out_images[key] = image
@@ -389,9 +329,9 @@ class ValueImageProcessor(ImageProcessingMixin):
             if image_masks_dict is not None and key in image_masks_dict:
                 out_masks[key] = image_masks_dict[key]
             else:
-                batch_size = image.shape[0]
+                bsize = image.shape[0]
                 out_masks[key] = torch.ones(
-                    batch_size, dtype=torch.bool, device=image.device
+                    bsize, dtype=torch.bool, device=image.device
                 )
 
         return out_images, out_masks
@@ -405,19 +345,6 @@ class ValueImageProcessor(ImageProcessingMixin):
         train: bool = False,
         **kwargs,
     ) -> BatchFeature:
-        """
-        Process images for value model following OpenPI's preprocessing.
-
-        Args:
-            images: Dict of images with OpenPI camera keys or list/tensor of images
-            image_masks: Optional dict of image masks
-            return_tensors: Type of tensors to return
-            do_augment: Whether to apply augmentations (overrides self.do_augment)
-            train: Whether in training mode
-
-        Returns:
-            BatchFeature containing processed images and image masks
-        """
         apply_augmentations = train and (
             do_augment if do_augment is not None else self.do_augment
         )
@@ -429,36 +356,49 @@ class ValueImageProcessor(ImageProcessingMixin):
         return {"pixel_values": output_images, "image_masks": output_masks}
 
 
-class ValueProcessor(ProcessorMixin):
-    """
-    Value model processor combining image preprocessing and text tokenization.
+class Pistar06ValueProcessor(ProcessorMixin):
+    """Pistar06 value model processor.
 
-    Text template: ``Task: {prompt}.``
-    All prefix tokens use bidirectional attention. The value model's expert head
-    predicts the value via a [CLS] token appended at the model level.
+    Standalone — does not inherit from or import any class in
+    ``rlinf.models.embodiment.value_model.processing``.
+
+    Text templates (byte-for-byte matches the external Evo-RL reference
+    ``lerobot/values/pistar06/processor_pistar06.py``
+    ``Pistar06PrepareTaskPromptProcessorStep.__call__``):
+
+        - With state (``include_state_in_prompt=True`` and state is not None):
+          ``Task: {prompt}, State: {b0 b1 ... bN}\\nValue: ``
+          where each ``bi`` is the integer bucket index of the corresponding
+          state dim, obtained by clipping to ``[-1, 1]`` and applying
+          ``np.digitize`` over ``state_discretization_bins`` uniform buckets.
+        - Without state: ``Task: {prompt}\\nValue: ``
     """
 
     attributes = ["image_processor", "tokenizer"]
-    image_processor_class = "ValueImageProcessor"
+    image_processor_class = "Pistar06ValueImageProcessor"
     tokenizer_class = "AutoTokenizer"
     _tokenize_log_count = 0
 
     def __init__(
         self,
-        image_processor: Optional[ValueImageProcessor] = None,
+        image_processor: Optional[Pistar06ValueImageProcessor] = None,
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         max_token_len: int = 200,
         tokenizer_name_or_path: Optional[str] = None,
         image_keys: Optional[tuple] = None,
         do_augment: bool = True,
+        include_state_in_prompt: bool = True,
+        max_state_dim: int = 32,
+        state_discretization_bins: int = 256,
         **kwargs,
     ):
         if image_processor is None:
-            # Use custom image_keys if provided, otherwise use defaults
             image_processor = (
-                ValueImageProcessor(image_keys=image_keys, do_augment=do_augment)
+                Pistar06ValueImageProcessor(
+                    image_keys=image_keys, do_augment=do_augment
+                )
                 if image_keys
-                else ValueImageProcessor(do_augment=do_augment)
+                else Pistar06ValueImageProcessor(do_augment=do_augment)
             )
 
         if tokenizer is None:
@@ -480,41 +420,75 @@ class ValueProcessor(ProcessorMixin):
         self.tokenizer: PreTrainedTokenizerBase = tokenizer
         self.max_token_len = max_token_len
         self.tokenizer_name_or_path = tokenizer_name_or_path
-        # Required for save_pretrained compatibility with transformers ProcessorMixin
+        self.include_state_in_prompt = include_state_in_prompt
+        self.max_state_dim = max_state_dim
+        self.state_discretization_bins = state_discretization_bins
+        # Required for save_pretrained compatibility.
         self.chat_template = None
         self.audio_tokenizer = None
 
     def _clean_text(self, text: str) -> str:
-        """Clean text by stripping and normalizing."""
         return text.lower().strip().replace("_", " ").replace("\n", " ")
 
     def _strip_trailing_punctuation(self, text: str) -> str:
-        """Remove trailing punctuation from text, but preserve quotes."""
         if text and text[-1] in string.punctuation and text[-1] not in "\"'":
             return text[:-1]
         return text
 
+    def _build_prefix_text(
+        self, prompt: str, state: Optional[np.ndarray] = None
+    ) -> str:
+        """Build the prefix text given a task prompt and optional state.
+
+        Byte-for-byte matches the external Evo-RL reference in
+        ``lerobot/values/pistar06/processor_pistar06.py``
+        (``Pistar06PrepareTaskPromptProcessorStep.__call__`` lines 115-118).
+
+        When ``self.include_state_in_prompt`` is True and ``state`` is provided,
+        the state is padded/truncated to ``self.max_state_dim``, clipped to
+        ``[-1, 1]``, discretized via ``np.digitize`` into
+        ``self.state_discretization_bins`` uniform buckets, and serialized as
+        a space-separated string:
+
+            ``Task: {cleaned}, State: {b0 b1 ... bN}\\nValue: ``
+
+        Otherwise (``include_state_in_prompt=False`` or ``state is None``):
+
+            ``Task: {cleaned}\\nValue: ``
+        """
+        cleaned = self._strip_trailing_punctuation(self._clean_text(prompt))
+        if not self.include_state_in_prompt or state is None:
+            return f"Task: {cleaned}\nValue: "
+
+        state_arr = np.asarray(state, dtype=np.float32).reshape(-1)
+        target_dim = int(self.max_state_dim)
+        if state_arr.shape[0] < target_dim:
+            state_arr = np.pad(
+                state_arr,
+                (0, target_dim - state_arr.shape[0]),
+                constant_values=0.0,
+            )
+        elif state_arr.shape[0] > target_dim:
+            state_arr = state_arr[:target_dim]
+
+        state_arr = np.clip(state_arr, -1.0, 1.0)
+        bins = int(self.state_discretization_bins)
+        # Interior edges only → np.digitize returns indices in [0, bins-1].
+        edges = np.linspace(-1.0, 1.0, bins + 1, dtype=np.float32)[1:-1]
+        bucket_indices = np.digitize(state_arr, edges)
+        state_str = " ".join(str(int(b)) for b in bucket_indices)
+        return f"Task: {cleaned}, State: {state_str}\nValue: "
+
     def _tokenize_single(
         self,
         prompt: str,
+        state: Optional[np.ndarray] = None,
         max_length: Optional[int] = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Tokenize a prompt into the value model's input format.
-
-        Template: ``Task: {prompt}.``
-
-        All tokens use bidirectional attention. The model's forward() only
-        uses (tokens, mask); loss_mask and kv_cache_mask are not consumed,
-        so they are not produced here.
-
-        Returns:
-            (tokens, mask) as numpy arrays of shape (max_length,).
-        """
         if max_length is None:
             max_length = self.max_token_len
 
-        cleaned = self._strip_trailing_punctuation(self._clean_text(prompt))
-        prefix_text = f"Task: {cleaned}."
+        prefix_text = self._build_prefix_text(prompt, state)
         tokens = self.tokenizer.encode(prefix_text, add_special_tokens=True)
 
         seq_len = len(tokens)
@@ -537,16 +511,19 @@ class ValueProcessor(ProcessorMixin):
         if (
             is_worker_0
             and int(os.environ.get("RANK", 0)) == 0
-            and ValueProcessor._tokenize_log_count < 2
+            and Pistar06ValueProcessor._tokenize_log_count < 2
         ):
-            ValueProcessor._tokenize_log_count += 1
+            Pistar06ValueProcessor._tokenize_log_count += 1
             decoded = self.tokenizer.decode(tokens, skip_special_tokens=False)
             logger.info(
-                "[Tokenization Example #%d] prompt=%r → %r  (len=%d)",
+                "[Tokenization Example #%d] prompt=%r (state=%s) → %r  "
+                "(raw_len=%d, pad_to=%d)",
                 self._tokenize_log_count,
                 prompt,
+                "provided" if state is not None else "none",
                 decoded,
                 seq_len,
+                max_length,
             )
 
         return np.asarray(tokens), np.asarray(mask)
@@ -554,32 +531,58 @@ class ValueProcessor(ProcessorMixin):
     def process_text(
         self,
         prompts: list[str],
+        states: Optional[Union[np.ndarray, torch.Tensor, list]] = None,
         max_length: Optional[int] = None,
         return_tensors: Optional[str] = "pt",
-        states=None,  # noqa: ARG002 — accepted for signature parity with Pistar06ValueProcessor; unused here
         **kwargs,
     ) -> dict[str, torch.Tensor]:
-        """Process a batch of prompts for the value model.
+        """Tokenize a batch of prompts with optional per-sample state.
 
-        Returns:
-            Dict with ``input_ids``, ``attention_mask``.
+        Args:
+            prompts: List of task prompts.
+            states: Optional batched state — either ``np.ndarray``/``torch.Tensor``
+                of shape ``[B, D]`` or a list of length ``B`` whose elements are
+                1-D arrays. When provided (and ``include_state_in_prompt=True``),
+                state is threaded into each prompt via ``_build_prefix_text``.
+            max_length: Padding/truncation length. Defaults to ``self.max_token_len``.
+            return_tensors: ``"pt"`` returns ``torch.Tensor``; otherwise ``np.ndarray``.
 
-        The ``states`` kwarg is accepted but ignored; it exists so the shared
-        ``ValueDataCollator`` can route state through either processor variant
-        uniformly without type inspection. Only ``Pistar06ValueProcessor``
-        actually uses it.
+        Extra ``**kwargs`` are accepted and ignored for forward-compat with the
+        non-evorl ``ValueProcessor`` signature.
         """
-        del states, kwargs  # see docstring
+        del kwargs  # accepted for signature parity with non-evorl ValueProcessor
         if max_length is None:
             max_length = self.max_token_len
+
+        if states is not None:
+            if isinstance(states, torch.Tensor):
+                states = states.detach().cpu().numpy()
+            if isinstance(states, np.ndarray):
+                if states.ndim == 1:
+                    states = states[None, :]
+                if states.shape[0] != len(prompts):
+                    raise ValueError(
+                        f"states batch size ({states.shape[0]}) does not match "
+                        f"prompts batch size ({len(prompts)})"
+                    )
+            elif isinstance(states, (list, tuple)):
+                if len(states) != len(prompts):
+                    raise ValueError(
+                        f"states length ({len(states)}) does not match "
+                        f"prompts length ({len(prompts)})"
+                    )
+            else:
+                raise TypeError(
+                    f"states must be ndarray/Tensor/list, got {type(states)}"
+                )
 
         batch_tokens = []
         batch_masks = []
 
-        for prompt in prompts:
+        for i, prompt in enumerate(prompts):
+            state_i = states[i] if states is not None else None
             tokens, mask = self._tokenize_single(
-                prompt=prompt,
-                max_length=max_length,
+                prompt=prompt, state=state_i, max_length=max_length
             )
             batch_tokens.append(tokens)
             batch_masks.append(mask)
@@ -599,20 +602,11 @@ class ValueProcessor(ProcessorMixin):
         text: Optional[Union[str, list[str]]] = None,
         images: Union[dict[str, torch.Tensor], list[torch.Tensor], torch.Tensor] = None,
         image_masks: Optional[dict[str, torch.Tensor]] = None,
+        state: Optional[Union[np.ndarray, torch.Tensor, list]] = None,
         return_tensors: Optional[str] = "pt",
         train: bool = False,
         **kwargs,
     ) -> BatchFeature:
-        """
-        Process text and images for value model.
-
-        Args:
-            text: Input text (prompt)
-            images: Image dict with camera keys
-            image_masks: Optional image masks
-            return_tensors: Output tensor format
-            train: Whether in training mode
-        """
         if text is None and images is None:
             raise ValueError("You must provide either text or images")
 
@@ -621,9 +615,24 @@ class ValueProcessor(ProcessorMixin):
         if text is not None:
             is_batched = isinstance(text, list)
             texts = text if is_batched else [text]
+            # When a single prompt is passed alongside a single state, lift the
+            # state to a batch of 1 so the per-sample path below still works.
+            batched_state = state
+            if state is not None and not is_batched:
+                if isinstance(state, torch.Tensor):
+                    batched_state = state.detach().cpu().numpy()
+                    if batched_state.ndim == 1:
+                        batched_state = batched_state[None, :]
+                elif isinstance(state, np.ndarray):
+                    if state.ndim == 1:
+                        batched_state = state[None, :]
+                elif isinstance(state, (list, tuple)):
+                    # Already iterable; wrap in outer list.
+                    batched_state = [state]
 
             processed = self.process_text(
                 prompts=texts,
+                states=batched_state,
                 return_tensors=return_tensors,
             )
             result_data.update(processed)
@@ -645,7 +654,6 @@ class ValueProcessor(ProcessorMixin):
         return BatchFeature(data=result_data, tensor_type=return_tensors)
 
     def decode(self, token_ids: Union[list[int], torch.Tensor], **kwargs) -> str:
-        """Decode tokens to text."""
         if isinstance(token_ids, torch.Tensor):
             token_ids = token_ids.tolist()
         token_ids = [t for t in token_ids if t != 0]
@@ -654,7 +662,6 @@ class ValueProcessor(ProcessorMixin):
     def batch_decode(
         self, token_ids_batch: Union[list[list[int]], torch.Tensor], **kwargs
     ) -> list[str]:
-        """Decode batch of tokens to text."""
         if isinstance(token_ids_batch, torch.Tensor):
             token_ids_batch = token_ids_batch.tolist()
         return [self.decode(tokens, **kwargs) for tokens in token_ids_batch]
@@ -670,7 +677,10 @@ class ValueProcessor(ProcessorMixin):
 
 
 __all__ = [
-    "ValueImageProcessor",
-    "ValueProcessor",
-    "normalize_image_to_model_format",
+    "Pistar06ValueImageProcessor",
+    "Pistar06ValueProcessor",
+    "normalize_image_to_pistar06_format",
+    "resize_with_pad",
+    "IMAGE_KEYS",
+    "IMAGE_RESOLUTION",
 ]

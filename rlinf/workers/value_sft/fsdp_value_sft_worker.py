@@ -149,11 +149,34 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             pass
 
         from rlinf.data.datasets.cfg import ValueDataset
-        from rlinf.models.embodiment.value_model.data_collator import ValueDataCollator
-        from rlinf.models.embodiment.value_model.processing import ValueProcessor
 
         data_cfg = self.cfg.get("data", {})
         model_cfg = self.cfg.actor.model
+
+        # Dispatch processor / collator / has_tokenizer_files based on model_type.
+        # Both branches expose the same constructor signature
+        # (max_token_len, tokenizer_name_or_path, do_augment) and produce a
+        # batch dict in the same format, so the rest of build_dataloader is
+        # model-agnostic.
+        model_type_str = getattr(model_cfg, "model_type", "value_model")
+        if model_type_str == "value_model_evorl":
+            from rlinf.models.embodiment.value_model.checkpoint_utils import (
+                has_tokenizer_files,
+            )
+            from rlinf.models.embodiment.value_model.data_collator import (
+                ValueDataCollator,
+            )
+            from rlinf.models.embodiment.value_model_evorl.processing import (
+                Pistar06ValueProcessor as ValueProcessor,
+            )
+        else:
+            from rlinf.models.embodiment.value_model.checkpoint_utils import (
+                has_tokenizer_files,
+            )
+            from rlinf.models.embodiment.value_model.data_collator import (
+                ValueDataCollator,
+            )
+            from rlinf.models.embodiment.value_model.processing import ValueProcessor
         pin_memory = data_cfg.get("pin_memory", True)
         train_num_workers = int(data_cfg.get("train_num_workers", 0))
         eval_num_workers = int(data_cfg.get("eval_num_workers", train_num_workers))
@@ -171,25 +194,44 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
                     kwargs["prefetch_factor"] = int(prefetch_factor)
             return kwargs
 
-        # Tokenizer resolution: explicit tokenizer_path > backbone path > error
-        from rlinf.models.embodiment.value_model.checkpoint_utils import (
-            has_tokenizer_files,
-        )
-
+        # Tokenizer resolution: explicit tokenizer_path > backbone path > error.
+        # ``has_tokenizer_files`` was already imported above via the model_type
+        # dispatch, so no second import is needed here.
         tokenizer_path = getattr(model_cfg, "tokenizer_path", None)
         if tokenizer_path is None:
-            tokenizer_path = getattr(model_cfg, "gemma3_path", None)
+            # value_model uses gemma3_path; value_model_evorl uses language_repo_id.
+            tokenizer_path = getattr(model_cfg, "gemma3_path", None) or getattr(
+                model_cfg, "language_repo_id", None
+            )
         if tokenizer_path is None or not has_tokenizer_files(Path(tokenizer_path)):
             raise ValueError(
                 f"No tokenizer found. "
-                f"Set model.tokenizer_path or model.gemma3_path explicitly. "
+                f"Set model.tokenizer_path, model.gemma3_path, or "
+                f"model.language_repo_id explicitly. "
                 f"Tried: {tokenizer_path}"
             )
-        processor = ValueProcessor(
-            max_token_len=getattr(model_cfg, "max_token_len", 200),
-            tokenizer_name_or_path=tokenizer_path,
-            do_augment=bool(data_cfg.get("do_augment", True)),
-        )
+        processor_kwargs = {
+            "max_token_len": getattr(model_cfg, "max_token_len", 200),
+            "tokenizer_name_or_path": tokenizer_path,
+            "do_augment": bool(data_cfg.get("do_augment", True)),
+        }
+        if model_type_str == "value_model_evorl":
+            # State-in-prompt is only supported by Pistar06ValueProcessor;
+            # the non-evorl ValueProcessor does not use these fields.
+            processor_kwargs.update(
+                {
+                    "include_state_in_prompt": bool(
+                        getattr(model_cfg, "include_state_in_prompt", True)
+                    ),
+                    "max_state_dim": int(
+                        getattr(model_cfg, "max_state_dim", 32)
+                    ),
+                    "state_discretization_bins": int(
+                        getattr(model_cfg, "state_discretization_bins", 256)
+                    ),
+                }
+            )
+        processor = ValueProcessor(**processor_kwargs)
         train_collator = ValueDataCollator(
             processor=processor,
             max_length=getattr(model_cfg, "max_token_len", 200),
@@ -221,6 +263,12 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             ),
             "robot_type": robot_type,
             "model_type": model_type,
+            # Optional quantile norm stats for state normalization. When
+            # include_state_in_prompt=True these MUST be provided; without them
+            # state reaches Pistar06ValueProcessor in raw joint space and
+            # digitizes catastrophically.
+            "norm_stats_dir": data_cfg.get("norm_stats_dir"),
+            "asset_id": data_cfg.get("asset_id"),
         }
 
         datasets_list = data_cfg.get("train_data_paths", [])
@@ -377,7 +425,7 @@ class FSDPValueSftWorker(FSDPModelManager, Worker):
             f"pin_memory={pin_memory}"
         )
 
-        data_config = {"model_type": "value_model"}
+        data_config = {"model_type": model_type_str}
         train_data_loader = ValueDataLoaderImpl(data_config, torch_loader)
 
         eval_data_loaders: list[tuple[str, ValueDataLoaderImpl]] = []

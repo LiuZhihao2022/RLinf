@@ -1,0 +1,165 @@
+# Usage: bash run_value_sft.sh libero_sft_value_evorl
+#
+# Pistar06 evorl value model SFT — independent of value_model/.
+
+defaults:
+  - model/value_evorl@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "value_sft_evorl"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 8000
+  max_steps: -1
+  val_check_interval: 500
+  save_interval: 3000
+
+data:
+  train_data_paths:
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pick_and_place_sft_data
+      type: sft
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pnp_eval_sft_ckpt8000_0403_collect1
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pnp_eval_sft_ckpt8000_0403_collect2
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pnp_eval_sft_ckpt8000_0403_collect3
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pnp_eval_sft_ckpt8000_0404_collect1
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pnp_eval_sft_ckpt8000_0404_collect2
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pnp_eval_sft_ckpt8000_0404_collect3
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pnp_eval_sft_ckpt8000_0404_collect4
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pnp_eval_sft_ckpt8000_0404_collect5
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pnp_eval_sft_ckpt8000_0404_collect6
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_data_clean_0410/pnp_eval_sft_ckpt8000_0409_collect1_clean
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_data_clean_0410/pnp_eval_sft_ckpt8000_0410_collect1_clean
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_data_clean_0410/pnp_eval_sft_ckpt8000_0410_collect2_clean
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_data_clean_0410/pnp_eval_sft_ckpt8000_0410_collect3_clean
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_data_clean_0410/pnp_eval_sft_ckpt8000_0410_collect4_clean
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_data_clean_0410/pnp_eval_sft_ckpt8000_0410_collect5_clean
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_data_clean_0410/pnp_eval_sft_ckpt8000_0410_collect6_clean
+      type: rollout
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_data_clean_0410/pnp_eval_sft_ckpt8000_0410_collect7_clean
+      type: rollout
+
+  eval_data_paths:
+    - dataset_path: /mnt/project_rlinf_hs/liuzhihao/data_to_use/pnp_merge_processed/pnp_eval_sft_ckpt8000_0404_collect7_for_eval
+  tag: fail150
+  # ----- dataloader performance -----
+  train_num_workers: 8
+  eval_num_workers: 4
+  prefetch_factor: 4
+  persistent_workers: false
+  pin_memory: false
+  do_augment: false
+  # ----- shared dataset params -----
+  include_state: true
+  gamma: 1.0
+  action_horizon: 10
+  normalize_to_minus_one_zero: true
+  include_next_obs: false
+  action_dim: 7
+  robot_type: "libero"
+  model_type: "pi05"
+  # State normalization: path contains norm_stats.json at its root (flat
+  # layout; load_norm_stats will find it via the fallback path). Reused by
+  # ValueDataset to inject openpi Normalize(use_quantiles=True) into the
+  # training transform pipeline, mirroring
+  # modeling_critic.from_checkpoint → build_input_transforms. Required when
+  # actor.model.include_state_in_prompt=true.
+  norm_stats_dir: /mnt/project_rlinf_hs/chenkang/openpi-main/checkpoints/torch/pi05_base/shuangqing_real/pick_and_place_state
+  asset_id: libero
+
+  # ----- mixture settings -----
+  balance_weights: true
+  seed: 42
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 4
+  global_batch_size: 64
+  seed: 0
+
+  model:
+    # Most fields come from `model/value_evorl@actor.model` defaults entry.
+    # Override per-experiment knobs here as needed:
+    action_dim: 7
+    action_horizon: 10
+    freeze_vision_encoder: false
+    freeze_language_model: false
+    fusion_hidden_dim: 512
+    dropout: 0.1
+    num_bins: 201
+    v_min: -1.0
+    v_max: 0.0
+    vision_repo_id: /mnt/project_rlinf_hs/liuzhihao/RLinf_pi06_release_final_clean/pretrained_models/siglip-so400m-patch14-384
+    language_repo_id: /mnt/project_rlinf_hs/liuzhihao/RLinf_pi06_release_final_clean/pretrained_models/gemma-3-270m
+    tokenizer_path: /mnt/project_rlinf_hs/liuzhihao/RLinf_pi06_release_final_clean/pretrained_models/gemma-3-270m
+    # State-in-prompt (align with external Evo-RL reference). Requires
+    # data.norm_stats_dir to be set so state arrives in [-1, 1].
+    include_state_in_prompt: true
+    max_state_dim: 32
+    state_discretization_bins: 256
+    max_token_len: 200
+
+  optim:
+    lr: 5.0e-5
+    value_lr: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-5
+    clip_grad: 10.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 500
+    total_training_steps: 8000
+    min_lr: 1.0e-6
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
