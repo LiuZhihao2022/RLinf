@@ -345,6 +345,13 @@ class Pistar06ValueCriticModel(nn.Module):
         language_repo_id: Optional[str] = None,
         fusion_hidden_dim: int = 512,
         dropout: float = 0.1,
+        # State-in-prompt and interface compat — must match training config.
+        include_state_in_prompt: bool = True,
+        max_state_dim: int = 32,
+        state_discretization_bins: int = 256,
+        max_token_len: int = 200,
+        action_dim: int = 32,
+        action_horizon: int = 50,
         **kwargs,
     ) -> "Pistar06ValueCriticModel":
         """Build a Pistar06ValueCriticModel from a checkpoint, ready for inference.
@@ -379,6 +386,12 @@ class Pistar06ValueCriticModel(nn.Module):
                 "v_max": return_max,
                 "fusion_hidden_dim": fusion_hidden_dim,
                 "dropout": dropout,
+                "include_state_in_prompt": include_state_in_prompt,
+                "max_state_dim": max_state_dim,
+                "state_discretization_bins": state_discretization_bins,
+                "max_token_len": max_token_len,
+                "action_dim": action_dim,
+                "action_horizon": action_horizon,
             }
         )
         model = get_model(cfg)

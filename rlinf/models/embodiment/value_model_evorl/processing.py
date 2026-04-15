@@ -578,7 +578,6 @@ class Pistar06ValueProcessor(ProcessorMixin):
 
         batch_tokens = []
         batch_masks = []
-
         for i, prompt in enumerate(prompts):
             state_i = states[i] if states is not None else None
             tokens, mask = self._tokenize_single(

@@ -518,7 +518,6 @@ class Pistar06Model(nn.Module):
             bsize * num_cameras, *processed_images.shape[2:]
         )
         flat_images = flat_images.to(dtype=self.model_dtype)
-
         image_context = (
             torch.no_grad() if self.cfg.freeze_vision_encoder else nullcontext()
         )
