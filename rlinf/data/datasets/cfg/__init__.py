@@ -35,6 +35,7 @@ from typing import Any, Iterator
 
 from rlinf.data.datasets.cfg.mixture_datasets import (  # noqa: E402
     CfgMixtureDataset,
+    PairMixtureDataset,
     ValueMixtureDataset,
 )
 from rlinf.data.datasets.cfg.return_loaders import (  # noqa: E402
@@ -126,6 +127,7 @@ __all__ = [
     "load_returns_sidecar",
     "ValueDataset",
     "CfgMixtureDataset",
+    "PairMixtureDataset",
     "ValueMixtureDataset",
     "ValueDataLoaderImpl",
     "TokenizePromptWithGuidance",

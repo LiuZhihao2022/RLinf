@@ -34,6 +34,10 @@ def get_model(cfg: DictConfig):
         from rlinf.models.embodiment.value_model import (
             get_value_model as get_model,
         )
+    elif model_type == SupportedModel.VALUE_MODEL_EVORL:
+        from rlinf.models.embodiment.value_model_evorl import get_model
+    elif model_type == SupportedModel.BINARY_VALUE_REWIND_ARM:
+        from rlinf.models.embodiment.value_model_rewind_arm import get_model
     elif model_type == SupportedModel.MLP_POLICY:
         from rlinf.models.embodiment.mlp_policy import get_model
     elif model_type == SupportedModel.GR00T:

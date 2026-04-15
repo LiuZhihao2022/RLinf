@@ -17,6 +17,7 @@ Mixture datasets for value and advantage training.
 
 This module provides:
 - CfgMixtureDataset: for CFG-RL training with binary advantage labels
+- PairMixtureDataset: for training binary rewind value models on multiple datasets
 - ValueMixtureDataset: for training value models on multiple datasets
 """
 
@@ -149,6 +150,27 @@ class CfgMixtureDataset(_MixtureBase):
         super().__init__(datasets, mode, balance_dataset_weights, seed)
 
         logger.info("CfgMixtureDataset initialized:")
+        logger.info(f"  Datasets: {len(self.datasets)}")
+        logger.info(f"  Total samples: {sum(self._dataset_lengths)}")
+        logger.info(f"  Dataset lengths: {self._dataset_lengths.tolist()}")
+        logger.info(f"  Raw weights: {self._raw_weights.tolist()}")
+        logger.info(f"  Sampling weights: {self._dataset_sampling_weights.tolist()}")
+        logger.info(f"  Mode: {mode}")
+
+
+class PairMixtureDataset(_MixtureBase):
+    """Mixture of multiple PairDatasets with weighted sampling."""
+
+    def __init__(
+        self,
+        datasets: Sequence[tuple[SizedDataset, float]],
+        mode: str = "train",
+        balance_dataset_weights: bool = True,
+        seed: int = 42,
+    ):
+        super().__init__(datasets, mode, balance_dataset_weights, seed)
+
+        logger.info("PairMixtureDataset initialized:")
         logger.info(f"  Datasets: {len(self.datasets)}")
         logger.info(f"  Total samples: {sum(self._dataset_lengths)}")
         logger.info(f"  Dataset lengths: {self._dataset_lengths.tolist()}")
