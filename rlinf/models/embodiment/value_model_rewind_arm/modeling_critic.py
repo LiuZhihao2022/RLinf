@@ -40,8 +40,9 @@ Public API (mirrors value_model.modeling_critic.ValueCriticModel):
 """
 
 import logging
+import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
@@ -50,25 +51,73 @@ from torch import Tensor
 from transformers.modeling_outputs import ModelOutput
 
 from .configuration import BinaryValueConfig
-from .modeling_rewind_arm import CLASS_PROGRESS, NUM_CLASSES, RewindArmBackbone
+from .modeling_rewind_arm import (
+    CLASS_PROGRESS,
+    NUM_CLASSES,
+    RewindArmBackbone,
+    _module_parameter_dtype,
+)
+
+if TYPE_CHECKING:
+    # Type-check-only import to avoid a circular dependency: the ensemble
+    # wrapper imports BinaryValueCriticModel, so keep the back-reference
+    # out of runtime.
+    from .ensemble_modeling_critic import EnsembleBinaryValueCriticModel
 
 logger = logging.getLogger(__name__)
 
 
+def _resolve_tokenizer_source(
+    checkpoint_dir,
+    explicit_tokenizer_path: Optional[str],
+    model_config: BinaryValueConfig,
+) -> tuple[str, bool]:
+    """Resolve the tokenizer source for inference-time checkpoint loading."""
+    tokenizer_files = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    )
+
+    if explicit_tokenizer_path:
+        return explicit_tokenizer_path, os.path.exists(explicit_tokenizer_path)
+
+    if any(os.path.exists(os.path.join(str(checkpoint_dir), name)) for name in tokenizer_files):
+        return str(checkpoint_dir), True
+
+    model_tokenizer_source = getattr(model_config, "language_repo_id", None)
+    if model_tokenizer_source:
+        return model_tokenizer_source, os.path.exists(model_tokenizer_source)
+
+    raise ValueError(
+        "No tokenizer found. Set tokenizer_path, save tokenizer files into the "
+        f"checkpoint, or ensure the checkpoint config provides language_repo_id. "
+        f"checkpoint_dir={checkpoint_dir}"
+    )
+
+
 @dataclass
 class CriticOutput(ModelOutput):
-    """Output for the ARM + ReWiND binary critic.
+    """Output for the single-model ARM + ReWiND binary critic.
 
     Field list deliberately matches :class:`~rlinf.models.embodiment.value_model.\
 modeling_critic.CriticOutput` so worker code stays duck-type-compatible.
     For the binary variant:
 
-        * ``logits`` is ``[B]`` (a single logit per pair).
-        * ``probs`` is ``sigmoid(logits)`` — shape ``[B]``.
-        * ``predicted_values`` equals ``probs`` (same scalar-per-sample).
+        * ``logits`` is ``[B, 2]`` (``[regress_logit, progress_logit]``).
+        * ``probs`` is ``softmax(logits)`` — shape ``[B, 2]``.
+        * ``predicted_values`` is ``P(progress)`` — shape ``[B]``.
         * ``atoms`` is always ``None``.
         * ``cat_acc_best`` carries binary accuracy for parity with evorl
           logging (the other cat_* fields stay ``None``).
+
+    Ensemble aggregate fields (member-wise predictions, mean/min/variance)
+    are deliberately **not** on this dataclass — they live on
+    :class:`~rlinf.models.embodiment.value_model_rewind_arm.\
+ensemble_modeling_critic.EnsembleCriticOutput`, which is what the
+    :class:`EnsembleBinaryValueCriticModel` wrapper returns. Consumers that
+    need those stats must call ensemble-specific surfaces (see
+    ``ensemble_modeling_critic.py``).
     """
 
     loss: Optional[torch.FloatTensor] = None
@@ -141,6 +190,20 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
             if hasattr(submod, "gradient_checkpointing_disable"):
                 submod.gradient_checkpointing_disable()
         logger.info("Disabled gradient checkpointing for BinaryValueCriticModel")
+
+    def attach_runtime_assets(self, processor, input_transform, device) -> None:
+        """Attach inference-time runtime assets to this model instance.
+
+        Called from :meth:`from_checkpoint` to wire up the processor,
+        input transform pipeline, and device target so `infer` /
+        `infer_batch` / `_prepare_observation*` can run end-to-end. The
+        ensemble wrapper overrides this to also push the assets down to
+        every member — same method name, so the factory call site stays
+        polymorphic and never needs ``hasattr(model, "members")``.
+        """
+        self.processor = processor
+        self._input_transform = input_transform
+        self._device = device
 
     # ------------------------------------------------------------------
     # Observation -> tensor adapter
@@ -276,7 +339,13 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
             images=images,
             image_attention_mask=image_mask,
         )  # [B, fusion_hidden_dim * (num_frames_per_pair + 1)]
-        logits = self.model.value_head(hidden_states)  # [B, 2]
+        value_head_dtype = _module_parameter_dtype(
+            self.model.value_head,
+            hidden_states.dtype,
+        )
+        logits = self.model.value_head(
+            hidden_states.to(dtype=value_head_dtype)
+        )  # [B, 2]
 
         probs = F.softmax(logits, dim=-1)  # [B, 2] — [p_regress, p_progress]
         predicted_values = probs[:, CLASS_PROGRESS]  # [B] — P(progress)
@@ -320,11 +389,16 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
             images=images,
             image_attention_mask=image_mask,
         )
-        logits = self.model.value_head(hidden_states)  # [B, 2]
+        value_head_dtype = _module_parameter_dtype(
+            self.model.value_head,
+            hidden_states.dtype,
+        )
+        logits = self.model.value_head(hidden_states.to(dtype=value_head_dtype))  # [B, 2]
         probs = F.softmax(logits, dim=-1)  # [B, 2]
 
+        predicted_values = probs[:, CLASS_PROGRESS]
         return CriticOutput(
-            predicted_values=probs[:, CLASS_PROGRESS],
+            predicted_values=predicted_values,
             logits=logits,
             probs=probs,
             atoms=None,
@@ -346,22 +420,34 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
         model_type: str = "pi05",
         default_prompt: Optional[str] = None,
         norm_stats: Optional[dict] = None,
-        label_smoothing: float = 0.05,
-        num_frames_per_pair: int = 2,
+        label_smoothing: Optional[float] = None,
+        num_frames_per_pair: Optional[int] = None,
+        ensemble_size: Optional[int] = None,
+        inference_mode: Optional[str] = None,
+        precision: Optional[str] = None,
+        uwo_lambda: Optional[float] = None,
+        ensemble_head_seed_base: Optional[int] = None,
         tokenizer_path: Optional[str] = None,
         vision_repo_id: Optional[str] = None,
         language_repo_id: Optional[str] = None,
-        fusion_hidden_dim: int = 512,
-        dropout: float = 0.1,
+        fusion_hidden_dim: Optional[int] = None,
+        dropout: Optional[float] = None,
         # State-in-prompt and interface compat — must match training config.
-        include_state_in_prompt: bool = True,
-        max_state_dim: int = 32,
-        state_discretization_bins: int = 256,
-        max_token_len: int = 200,
+        include_state_in_prompt: Optional[bool] = None,
+        max_state_dim: Optional[int] = None,
+        state_discretization_bins: Optional[int] = None,
+        max_token_len: Optional[int] = None,
         **kwargs,
-    ) -> "BinaryValueCriticModel":
-        """Build a BinaryValueCriticModel from a checkpoint, ready for inference.
+    ) -> "BinaryValueCriticModel | EnsembleBinaryValueCriticModel":
+        """Build a binary value critic from a checkpoint, ready for inference.
 
+        Dispatches through :func:`get_model`: returns a single-model
+        :class:`BinaryValueCriticModel` when ``ensemble_size == 1``, or an
+        :class:`~rlinf.models.embodiment.value_model_rewind_arm.\
+ensemble_modeling_critic.EnsembleBinaryValueCriticModel` wrapper when
+        ``ensemble_size > 1``. Either return value exposes the same
+        ``predict`` / ``infer`` / ``infer_batch`` surface; callers that want
+        ensemble aggregate stats must call the ensemble-specific paths.
         Mirrors ``Pistar06ValueCriticModel.from_checkpoint`` so the offline
         pipeline (compute_advantages, etc.) dispatches on ``model_type`` and
         loads either variant via the same call shape.
@@ -373,54 +459,80 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
 
         from rlinf.models.embodiment.value_model.checkpoint_utils import (
             build_input_transforms,
-            has_tokenizer_files,
             load_norm_stats,
         )
 
         from . import get_model
-        from .processing import Pistar06ValueProcessor
+        from .processing import Pistar06ValueImageProcessor, Pistar06ValueProcessor
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         logger.info(f"Loading ARM+ReWiND binary value model from {checkpoint_dir}")
 
-        cfg = OmegaConf.create(
-            {
-                "model_path": str(checkpoint_dir),
-                "vision_repo_id": vision_repo_id,
-                "language_repo_id": language_repo_id,
-                "label_smoothing": label_smoothing,
-                "num_frames_per_pair": num_frames_per_pair,
-                "fusion_hidden_dim": fusion_hidden_dim,
-                "dropout": dropout,
-                "include_state_in_prompt": include_state_in_prompt,
-                "max_state_dim": max_state_dim,
-                "state_discretization_bins": state_discretization_bins,
-                "max_token_len": max_token_len,
-            }
-        )
+        cfg_dict = {"model_path": str(checkpoint_dir)}
+        optional_overrides = {
+            "vision_repo_id": vision_repo_id,
+            "language_repo_id": language_repo_id,
+            "label_smoothing": label_smoothing,
+            "num_frames_per_pair": num_frames_per_pair,
+            "ensemble_size": ensemble_size,
+            "inference_mode": inference_mode,
+            "precision": precision,
+            "uwo_lambda": uwo_lambda,
+            "ensemble_head_seed_base": ensemble_head_seed_base,
+            "fusion_hidden_dim": fusion_hidden_dim,
+            "dropout": dropout,
+            "include_state_in_prompt": include_state_in_prompt,
+            "max_state_dim": max_state_dim,
+            "state_discretization_bins": state_discretization_bins,
+            "max_token_len": max_token_len,
+        }
+        for key, value in optional_overrides.items():
+            if value is not None:
+                cfg_dict[key] = value
+
+        cfg = OmegaConf.create(cfg_dict)
         model = get_model(cfg)
 
         # Tokenizer resolution
+        tokenizer_source, tokenizer_local_only = _resolve_tokenizer_source(
+            checkpoint_dir=checkpoint_dir,
+            explicit_tokenizer_path=tokenizer_path,
+            model_config=model.config,
+        )
         if tokenizer_path:
-            logger.info("  Using explicit tokenizer_path: %s", tokenizer_path)
-            tokenizer = AutoTokenizer.from_pretrained(
-                tokenizer_path, add_bos_token=True, local_files_only=True
-            )
-        elif has_tokenizer_files(checkpoint_dir):
+            logger.info("  Using explicit tokenizer_path: %s", tokenizer_source)
+        elif str(tokenizer_source) == str(checkpoint_dir):
             logger.info("  Found tokenizer files in checkpoint")
-            tokenizer = AutoTokenizer.from_pretrained(
-                str(checkpoint_dir), add_bos_token=True, local_files_only=True
-            )
         else:
-            raise ValueError(
-                f"No tokenizer found. Set tokenizer_path or ensure checkpoint "
-                f"contains tokenizer files. checkpoint_dir={checkpoint_dir}"
+            logger.info(
+                "  Falling back to tokenizer source from model config: %s",
+                tokenizer_source,
             )
+
+        tokenizer_kwargs = {"add_bos_token": True}
+        if tokenizer_local_only:
+            tokenizer_kwargs["local_files_only"] = True
+        tokenizer = AutoTokenizer.from_pretrained(
+            tokenizer_source,
+            **tokenizer_kwargs,
+        )
+
+        image_processor = None
+        try:
+            image_processor = Pistar06ValueImageProcessor.from_pretrained(
+                str(checkpoint_dir),
+                local_files_only=True,
+            )
+            logger.info("  Found image processor config in checkpoint")
+        except (OSError, ValueError):
+            logger.info("  No image processor config found in checkpoint; using defaults")
+
         # Read state-in-prompt fields off the just-constructed model.config so
         # inference-time prompt construction matches what the model was trained
         # on. Backward-compat defaults kick in when the checkpoint predates
         # these fields.
         processor = Pistar06ValueProcessor(
+            image_processor=image_processor,
             tokenizer=tokenizer,
             max_token_len=getattr(model.config, "max_token_len", 200),
             include_state_in_prompt=getattr(
@@ -431,10 +543,6 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
                 model.config, "state_discretization_bins", 256
             ),
         )
-
-        model.processor = processor
-        model = model.to(device)
-        model.eval()
 
         # Norm stats
         if norm_stats is None:
@@ -465,8 +573,16 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
 
         from openpi.transforms import compose
 
-        model._input_transform = compose(transforms)
-        model._device = device
+        input_transform = compose(transforms)
+
+        model.attach_runtime_assets(
+            processor=processor,
+            input_transform=input_transform,
+            device=device,
+        )
+
+        model = model.to(device)
+        model.eval()
 
         logger.info("BinaryValueCriticModel.from_checkpoint ready for inference")
         return model
@@ -732,10 +848,9 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
         }
         inputs = self._input_transform(inputs)
         observation = self._prepare_observation(inputs)
-
-        values = self.predict_value(observation)
+        result = self.predict(observation)
         return {
-            "value": float(values[0].item()),
+            "value": float(result.predicted_values[0].item()),
             "state": obs.get("state", np.array([])),
         }
 
@@ -748,10 +863,10 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
         pretransformed: bool = False,
         already_cpu_prepared: bool = False,
     ) -> list[dict]:
-        """Batched inference. Returns one ``{"value": float}`` per input.
+        """Batched inference. Returns one dict of scalar stats per input.
 
         Independent copy of ``ValueCriticModel.infer_batch``. Calls
-        ``self.predict_value(observation)`` which routes through our own
+        ``self.predict(observation)`` which routes through our own
         forward → ``RewindArmBackbone.forward`` path.
         """
         import numpy as np
@@ -812,7 +927,8 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
 
                 observation = self._prepare_observation_batch(inputs_list)
 
-            values = self.predict_value(observation).cpu()
+            result = self.predict(observation)
+            values = result.predicted_values.cpu()
 
             for i in range(len(batch_obs)):
                 all_outputs.append({"value": float(values[i])})

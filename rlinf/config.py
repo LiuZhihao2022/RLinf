@@ -907,7 +907,39 @@ def validate_sft_cfg(cfg: DictConfig) -> DictConfig:
         else:
             # set the val_check_interval to -1 if there is no eval data
             cfg.runner.val_check_interval = -1
+        _validate_binary_value_ensemble_cfg(cfg.actor)
     return cfg
+
+
+def _validate_binary_value_ensemble_cfg(actor_cfg: DictConfig) -> None:
+    """Validate binary-value ensemble-specific settings."""
+    model_cfg = actor_cfg.get("model", None)
+    if model_cfg is None or model_cfg.get("model_type", None) != "binary_value_rewind_arm":
+        return
+
+    # Import lazily to avoid a circular dependency:
+    # rlinf.config -> rlinf.models.embodiment... -> rlinf.models -> rlinf.config
+    from rlinf.models.embodiment.value_model_rewind_arm.configuration import (
+        validate_binary_value_ensemble_settings,
+    )
+
+    try:
+        ensemble_size, inference_mode, uwo_lambda = (
+            validate_binary_value_ensemble_settings(
+                ensemble_size=model_cfg.get("ensemble_size", 1),
+                inference_mode=model_cfg.get("inference_mode", "mo"),
+                uwo_lambda=model_cfg.get("uwo_lambda", 1.0),
+                micro_batch_size=actor_cfg.micro_batch_size,
+                global_batch_size=actor_cfg.global_batch_size,
+            )
+        )
+    except ValueError as exc:
+        raise AssertionError(str(exc)) from exc
+
+    with open_dict(model_cfg):
+        model_cfg.ensemble_size = ensemble_size
+        model_cfg.inference_mode = inference_mode
+        model_cfg.uwo_lambda = uwo_lambda
 
 
 def validate_reasoning_cfg(cfg: DictConfig) -> DictConfig:

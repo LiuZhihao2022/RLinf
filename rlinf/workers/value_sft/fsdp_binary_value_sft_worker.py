@@ -42,7 +42,7 @@ logging.getLogger("av").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 import torch  # noqa: E402
-from omegaconf import DictConfig  # noqa: E402
+from omegaconf import DictConfig, open_dict  # noqa: E402
 
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager  # noqa: E402
 from rlinf.models import get_model  # noqa: E402
@@ -117,6 +117,54 @@ def _validate_train_dataset_shapes(
         )
 
 
+def _ensure_binary_value_precision_cfg(model_cfg: DictConfig) -> str:
+    """Default unset binary-value precision to fp32 for stable FSDP training.
+
+    The model load dtype controls FSDP's master parameter dtype. Loading in
+    bf16 makes the master copy bf16 too, which collapses Adam's second
+    moment after a couple of steps and produces non-finite ``hidden_states``
+    inside the SigLIP/Gemma backbone. Default to fp32 master and let
+    ``fsdp_config.mixed_precision.param_dtype`` decide the forward dtype.
+    """
+    precision = getattr(model_cfg, "precision", None)
+    if precision not in (None, "", "null"):
+        return str(precision)
+
+    with open_dict(model_cfg):
+        model_cfg.precision = "fp32"
+
+    logger.warning(
+        "[BinaryValueSFT] actor.model.precision was unset; defaulting to fp32 "
+        "so FSDP keeps an fp32 master copy. Forward compute dtype is still "
+        "controlled by fsdp_config.mixed_precision.param_dtype."
+    )
+    return str(model_cfg.precision)
+
+
+def _collect_non_finite_tensor_paths(value: Any, prefix: str) -> list[str]:
+    """Return dotted tensor paths whose values contain NaN/Inf."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0 or torch.isfinite(value.detach()).all():
+            return []
+        return [prefix]
+
+    if isinstance(value, dict):
+        bad_paths: list[str] = []
+        for key, child in value.items():
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            bad_paths.extend(_collect_non_finite_tensor_paths(child, child_prefix))
+        return bad_paths
+
+    if isinstance(value, (list, tuple)):
+        bad_paths = []
+        for idx, child in enumerate(value):
+            child_prefix = f"{prefix}[{idx}]"
+            bad_paths.extend(_collect_non_finite_tensor_paths(child, child_prefix))
+        return bad_paths
+
+    return []
+
+
 class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
     """FSDP worker for the ARM + ReWiND binary value critic.
 
@@ -144,7 +192,33 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             self.offload_optimizer()
 
     def model_provider_func(self) -> torch.nn.Module:
+        _ensure_binary_value_precision_cfg(self.cfg.actor.model)
+        ensemble_size = int(getattr(self.cfg.actor.model, "ensemble_size", 1))
+        if (
+            ensemble_size > 1
+            and getattr(self.cfg.actor.model, "ensemble_head_seed_base", None) is None
+        ):
+            with open_dict(self.cfg.actor.model):
+                self.cfg.actor.model.ensemble_head_seed_base = int(self.cfg.actor.seed)
         return get_model(self.cfg.actor.model)
+
+    def save_checkpoint(self, save_path: str, step: int = 0) -> None:
+        """Save weights plus lightweight checkpoint-side model assets."""
+        super().save_checkpoint(save_path, step)
+
+        if self._rank == 0:
+            from rlinf.models.embodiment.value_model_rewind_arm import (
+                save_binary_value_checkpoint_assets,
+            )
+
+            save_binary_value_checkpoint_assets(
+                save_path=save_path,
+                cfg=self.cfg.actor.model,
+                processor=getattr(self, "processor", None),
+            )
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     # ------------------------------------------------------------------
     # Dataloader
@@ -159,11 +233,11 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
         except (ImportError, AttributeError):
             pass
 
+        from rlinf.data.datasets.cfg.mixture_datasets import PairMixtureDataset
         from rlinf.data.datasets.cfg.rewind import (
             BinaryPairDataCollator,
             PairDataset,
         )
-        from rlinf.data.datasets.cfg.mixture_datasets import PairMixtureDataset
         from rlinf.models.embodiment.value_model.checkpoint_utils import (
             has_tokenizer_files,
         )
@@ -210,6 +284,7 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                 getattr(model_cfg, "state_discretization_bins", 256)
             ),
         )
+        self.processor = processor
         max_token_len = int(getattr(model_cfg, "max_token_len", 200))
         train_collator = BinaryPairDataCollator(
             processor=processor, max_length=max_token_len, train=True
@@ -281,9 +356,6 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                         ),
                     )
                 ),
-                prompt=str(
-                    entry.get("prompt", data_cfg.get("prompt", "perform the task"))
-                ),
                 k=int(data_cfg.get("k", 4)),
                 include_state=bool(
                     getattr(model_cfg, "include_state_in_prompt", False)
@@ -346,6 +418,26 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             len(train_dataset),
         )
 
+        # Per-member training treats each ensemble member's training as an
+        # independent SGD trajectory: ``actor.micro_batch_size`` and
+        # ``actor.global_batch_size`` describe one member's batching.
+        # Per global step the dataloader is consumed
+        # ``ensemble_size * grad_accum`` times (each member fetches its
+        # own ``grad_accum`` micro batches), so the actual sample
+        # throughput per rank is ``ensemble_size * grad_accum *
+        # micro_batch_size``.
+        ensemble_size = max(1, int(getattr(model_cfg, "ensemble_size", 1)))
+        train_loader_batch_size = int(self.cfg.actor.micro_batch_size)
+        if ensemble_size > 1:
+            logger.info(
+                "[BinaryValueSFT] Per-member dataloader batch_size=%d "
+                "(micro_batch_size is interpreted as the per-member micro "
+                "batch; each global step consumes ensemble_size=%d × "
+                "grad_accum batches from the loader).",
+                train_loader_batch_size,
+                ensemble_size,
+            )
+
         train_sampler = None
         if torch.distributed.is_initialized():
             train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -357,7 +449,7 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             )
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
-            batch_size=self.cfg.actor.micro_batch_size,
+            batch_size=train_loader_batch_size,
             shuffle=(train_sampler is None),
             sampler=train_sampler,
             drop_last=True,
@@ -419,24 +511,250 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
         labels = _to_device(batch["labels"])
         return observation, labels
 
-    def _metrics_from_output(self, result, labels: torch.Tensor) -> dict[str, float]:
+    def _raise_if_non_finite_training_step(
+        self,
+        result,
+        observation: dict[str, Any],
+        labels: torch.Tensor,
+        micro_batch_idx: int,
+        grad_accum: int,
+    ) -> None:
+        """Fail fast with actionable diagnostics when training tensors blow up."""
+        bad_paths: list[str] = []
+        bad_paths.extend(_collect_non_finite_tensor_paths(observation, "observation"))
+        bad_paths.extend(_collect_non_finite_tensor_paths(labels, "labels"))
+
+        for field_name in (
+            "loss",
+            "predicted_values",
+            "logits",
+            "probs",
+            "hidden_states",
+        ):
+            field_value = getattr(result, field_name, None)
+            bad_paths.extend(
+                _collect_non_finite_tensor_paths(field_value, f"result.{field_name}")
+            )
+
+        if not bad_paths:
+            return
+
+        label_pos_frac = float((labels > 0).to(dtype=torch.float32).mean().item())
+        global_step = int(getattr(self, "global_step", 0))
+        precision = getattr(self.cfg.actor.model, "precision", None)
+        unique_paths = ", ".join(sorted(set(bad_paths)))
+        raise FloatingPointError(
+            "Non-finite tensor detected during binary value SFT "
+            f"(global_step={global_step}, micro_batch={micro_batch_idx + 1}/{grad_accum}, "
+            f"precision={precision}, label_pos_frac={label_pos_frac:.4f}). "
+            f"Offending tensors: {unique_paths}. "
+            "Check precision settings and upstream batch contents."
+        )
+
+    def _fetch_next_batch(self) -> dict:
+        """Return the next training micro-batch; rotate epoch on exhaustion."""
+        try:
+            return next(self.data_iter)
+        except StopIteration:
+            new_epoch = getattr(self, "_current_epoch", 0) + 1
+            self._current_epoch = new_epoch
+            self.data_loader.set_epoch(new_epoch)
+            self.data_iter = iter(self.data_loader)
+            return next(self.data_iter)
+
+    def _backward_one_micro_batch(
+        self,
+        grad_accum: int,
+        micro_idx: int,
+        member_idx: int | None,
+    ) -> dict[str, float]:
+        """Forward + scaled backward on ONE micro batch. Returns metrics dict.
+
+        Pure per-micro-batch work: no optimizer step, no grad clearing —
+        those belong to the flow-level caller
+        (:meth:`_run_training_single` or :meth:`_run_training_ensemble`).
+
+        ``member_idx=None`` → single-model forward.
+        ``member_idx=int`` → per-member forward; the ensemble wrapper
+        routes the call to that specific member.
+        """
+        backward_ctx = self.before_micro_batch(
+            self.model, is_last_micro_batch=(micro_idx + 1) == grad_accum
+        )
+
+        batch = self._fetch_next_batch()
+        observation, labels = self._prepare_input(batch)
+
+        forward_kwargs: dict[str, Any] = {}
+        if member_idx is not None:
+            forward_kwargs["member_idx"] = int(member_idx)
+
+        with self.amp_context:
+            result = self.model(
+                observation=observation, labels=labels, **forward_kwargs
+            )
+            loss = result.loss
+        if loss is None:
+            raise RuntimeError(
+                "Binary value model returned no loss during training."
+            )
+
+        self._raise_if_non_finite_training_step(
+            result=result,
+            observation=observation,
+            labels=labels,
+            micro_batch_idx=micro_idx,
+            grad_accum=grad_accum,
+        )
+
+        # p_progress_std is intentionally not logged on the training path: in the
+        # ensemble flow each member trains on its own shuffled micro batch, so the
+        # within-batch std is shuffle noise, not ensemble disagreement. Eval covers
+        # the spread question on shared inputs instead.
         metrics: dict[str, float] = {}
         if result.loss is not None:
             metrics["loss"] = float(result.loss.detach().item())
         if result.cat_acc_best is not None:
             metrics["accuracy"] = float(result.cat_acc_best.detach().item())
         if result.predicted_values is not None:
-            probs = result.predicted_values.detach().float()
-            metrics["p_progress_mean"] = float(probs.mean().item())
-            metrics["p_progress_std"] = float(probs.std().item())
+            metrics["p_progress_mean"] = float(
+                result.predicted_values.detach().float().mean().item()
+            )
         if labels is not None:
             metrics["label_pos_frac"] = float(
                 (labels > 0).to(dtype=torch.float32).mean().item()
             )
+
+        scaled_loss = loss / grad_accum
+        with backward_ctx:
+            self.grad_scaler.scale(scaled_loss).backward()
+
         return metrics
 
+    @staticmethod
+    def _mean_metrics(metric_dicts: list[dict[str, float]]) -> dict[str, float]:
+        """Arithmetic-mean a list of per-batch metric dicts."""
+        agg: dict[str, list[float]] = {}
+        for m in metric_dicts:
+            for k, v in m.items():
+                agg.setdefault(k, []).append(v)
+        return {k: sum(v) / len(v) for k, v in agg.items()}
+
+    def _clear_non_current_member_grads(self, member_idx: int) -> None:
+        """Null sibling members' FSDP-materialized phantom grads.
+
+        Ensemble-only. Called after each member's backward in
+        :meth:`_run_training_ensemble` and before the optimizer step so
+        sibling-member parameters that share a FSDP flat-param bucket
+        with the currently trained member don't carry residual zero
+        grads into the step (with ``use_orig_params=True`` FSDP can
+        materialize those automatically).
+
+        Precondition: ``member_idx`` is a valid int (the caller is the
+        ensemble training flow, so ``ensemble_size > 1`` by construction).
+        No defensive early returns — if this gets called with an invalid
+        index it should fail loudly, not silently no-op.
+        """
+        current_member_tag = f"members.{int(member_idx)}."
+        for name, param in self.model.named_parameters():
+            if param.grad is None:
+                continue
+            if "members." not in name:
+                continue
+            if current_member_tag in name:
+                continue
+            if int(getattr(self, "global_step", 0)) < 2:
+                grad = param.grad.detach()
+                logger.warning(
+                    "[BinaryValueSFT][PHANTOM_GRAD] step=%d current_member=%d name=%s all_zero=%s grad_norm=%.6e",
+                    int(getattr(self, "global_step", 0)),
+                    int(member_idx),
+                    name,
+                    bool((grad == 0).all().item()),
+                    float(grad.float().norm().item()),
+                )
+            param.grad = None
+
+    def _run_training_single(self, grad_accum: int) -> dict[str, float]:
+        """Single-model global training step.
+
+        One grad-accum-long micro-batch loop followed by a single
+        optimizer step + ``zero_grad``. Returns the step-level metric
+        dict (micro-batch means + ``grad_norm`` + ``lr``).
+        """
+        micro_metrics = [
+            self._backward_one_micro_batch(
+                grad_accum=grad_accum,
+                micro_idx=micro_idx,
+                member_idx=None,
+            )
+            for micro_idx in range(grad_accum)
+        ]
+        grad_norm, lr_list = self.optimizer_step()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        train_metrics = self._mean_metrics(micro_metrics)
+        train_metrics["grad_norm"] = float(grad_norm)
+        train_metrics["lr"] = float(lr_list[0]) if lr_list else 0.0
+        return train_metrics
+
+    def _run_training_ensemble(
+        self,
+        grad_accum: int,
+        ensemble_size: int,
+    ) -> dict[str, float]:
+        """Ensemble global training step with per-member SGD trajectories.
+
+        Outer loop over members; inner loop fetches a fresh
+        ``grad_accum``-long sequence of micro batches from the
+        dataloader for that member. After each member's loop: clear
+        phantom grads on sibling members, step, zero_grad. Total loader
+        batches consumed per global step is
+        ``ensemble_size × grad_accum`` — each member trains on its own
+        independent random data (bagging), which is what makes the
+        ensemble's prediction variance a meaningful epistemic
+        uncertainty signal. Peak activations + gradients are only 1× a
+        single member instead of ``ensemble_size×`` thanks to the
+        sequential execution.
+        """
+        per_member_metrics: list[list[dict[str, float]]] = []
+        per_member_grad_norms: list[float] = []
+        last_lr_list: list[float] = []
+
+        for member_idx in range(ensemble_size):
+            micro_metrics = [
+                self._backward_one_micro_batch(
+                    grad_accum=grad_accum,
+                    micro_idx=micro_idx,
+                    member_idx=member_idx,
+                )
+                for micro_idx in range(grad_accum)
+            ]
+            self._clear_non_current_member_grads(member_idx)
+            grad_norm, lr_list = self.optimizer_step()
+            self.optimizer.zero_grad(set_to_none=True)
+
+            per_member_metrics.append(micro_metrics)
+            per_member_grad_norms.append(float(grad_norm))
+            last_lr_list = lr_list
+
+        flat_metrics = [m for member_list in per_member_metrics for m in member_list]
+        train_metrics = self._mean_metrics(flat_metrics)
+        train_metrics["grad_norm"] = max(per_member_grad_norms)
+        train_metrics["grad_norm_mean"] = sum(per_member_grad_norms) / len(
+            per_member_grad_norms
+        )
+        train_metrics["lr"] = float(last_lr_list[0]) if last_lr_list else 0.0
+        return train_metrics
+
     def run_training(self) -> dict[str, float]:
-        """Execute one global training step (with grad accumulation)."""
+        """Execute one global training step (dispatcher).
+
+        Dispatches to :meth:`_run_training_single` or
+        :meth:`_run_training_ensemble` based on ``ensemble_size``, then
+        all-reduces the metrics and steps the LR scheduler. Offload
+        bookends wrap the whole call when enabled.
+        """
         with self.worker_timer():
             if self.cfg.actor.get("enable_offload", False):
                 with self.device_lock:
@@ -444,7 +762,14 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                     self.load_optimizer(self.device)
 
             self.model.train()
-            if hasattr(self.model, "gradient_checkpointing_disable"):
+            use_grad_ckpt = bool(
+                getattr(self.cfg.actor.model, "use_gradient_checkpointing", False)
+            ) or bool(
+                getattr(self.cfg.actor.fsdp_config, "gradient_checkpointing", False)
+            )
+            if use_grad_ckpt and hasattr(self.model, "gradient_checkpointing_enable"):
+                self.model.gradient_checkpointing_enable()
+            elif hasattr(self.model, "gradient_checkpointing_disable"):
                 self.model.gradient_checkpointing_disable()
 
             micro_bs = self.cfg.actor.micro_batch_size
@@ -454,38 +779,12 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                 f"micro_batch_size * world_size = {micro_bs * self._world_size}"
             )
             grad_accum = global_bs // micro_bs // self._world_size
+            ensemble_size = int(getattr(self.cfg.actor.model, "ensemble_size", 1))
 
-            all_metrics: list[dict[str, float]] = []
-            for idx in range(grad_accum):
-                backward_ctx = self.before_micro_batch(
-                    self.model, is_last_micro_batch=(idx + 1) == grad_accum
-                )
-
-                batch = next(self.data_iter)
-                observation, labels = self._prepare_input(batch)
-
-                with self.amp_context:
-                    result = self.model(observation=observation, labels=labels)
-                    loss = result.loss
-
-                metrics = self._metrics_from_output(result, labels)
-
-                scaled_loss = loss / grad_accum
-                with backward_ctx:
-                    self.grad_scaler.scale(scaled_loss).backward()
-
-                all_metrics.append(metrics)
-
-            grad_norm, lr_list = self.optimizer_step()
-            self.optimizer.zero_grad(set_to_none=True)
-
-            agg: dict[str, list[float]] = {}
-            for m in all_metrics:
-                for k, v in m.items():
-                    agg.setdefault(k, []).append(v)
-            train_metrics = {k: sum(v) / len(v) for k, v in agg.items()}
-            train_metrics["grad_norm"] = float(grad_norm)
-            train_metrics["lr"] = float(lr_list[0]) if lr_list else 0.0
+            if ensemble_size > 1:
+                train_metrics = self._run_training_ensemble(grad_accum, ensemble_size)
+            else:
+                train_metrics = self._run_training_single(grad_accum)
 
             train_metrics = all_reduce_dict(
                 train_metrics, op=torch.distributed.ReduceOp.AVG
@@ -499,8 +798,86 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
 
             return train_metrics
 
+    def _eval_batch_single(
+        self,
+        observation: dict[str, Any],
+        labels: torch.Tensor,
+    ) -> dict[str, float]:
+        """Eval one batch on the single model. Returns the batch metric dict."""
+        with self.amp_context:
+            result = self.model(observation=observation, labels=labels)
+
+        metrics: dict[str, float] = {}
+        if result.loss is not None:
+            metrics["loss"] = float(result.loss.detach().item())
+        if result.cat_acc_best is not None:
+            metrics["accuracy"] = float(result.cat_acc_best.detach().item())
+        if result.predicted_values is not None:
+            probs = result.predicted_values.detach().float()
+            metrics["p_progress_mean"] = float(probs.mean().item())
+            if probs.numel() >= 2:
+                metrics["p_progress_std"] = float(probs.std(unbiased=False).item())
+            else:
+                metrics["p_progress_std"] = 0.0
+        if labels is not None:
+            metrics["label_pos_frac"] = float(
+                (labels > 0).to(dtype=torch.float32).mean().item()
+            )
+        return metrics
+
+    def _eval_batch_ensemble(
+        self,
+        observation: dict[str, Any],
+        labels: torch.Tensor,
+        ensemble_size: int,
+    ) -> dict[str, float]:
+        """Eval one batch on every ensemble member over the SAME inputs.
+
+        Members share the full eval batch (no chunk-slicing), so the
+        training-time "batch divisible by ensemble_size" constraint does
+        not apply. Member-wise metrics are averaged into a single batch
+        metric dict — same shape the single-model path returns, so the
+        outer ``run_eval`` aggregation is uniform.
+        """
+        member_metrics: list[dict[str, float]] = []
+        for m_idx in range(ensemble_size):
+            with self.amp_context:
+                result = self.model(
+                    observation=observation,
+                    labels=labels,
+                    member_idx=m_idx,
+                )
+
+            metrics: dict[str, float] = {}
+            if result.loss is not None:
+                metrics["loss"] = float(result.loss.detach().item())
+            if result.cat_acc_best is not None:
+                metrics["accuracy"] = float(result.cat_acc_best.detach().item())
+            if result.predicted_values is not None:
+                probs = result.predicted_values.detach().float()
+                metrics["p_progress_mean"] = float(probs.mean().item())
+                if probs.numel() >= 2:
+                    metrics["p_progress_std"] = float(
+                        probs.std(unbiased=False).item()
+                    )
+                else:
+                    metrics["p_progress_std"] = 0.0
+            if labels is not None:
+                metrics["label_pos_frac"] = float(
+                    (labels > 0).to(dtype=torch.float32).mean().item()
+                )
+            member_metrics.append(metrics)
+        return self._mean_metrics(member_metrics)
+
     def run_eval(self) -> dict[str, float]:
-        """Run eval over all eval datasets."""
+        """Run eval over every registered eval dataset.
+
+        Per-batch dispatch to :meth:`_eval_batch_single` or
+        :meth:`_eval_batch_ensemble` based on ``ensemble_size``;
+        per-dataset aggregation is then flattened with cross-dataset
+        means via ``<metric>`` keys (no prefix) alongside the
+        ``<dataset>/<metric>`` breakdown.
+        """
         if not self.eval_data_loaders:
             return {}
 
@@ -510,22 +887,23 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                     self.load_param_and_grad(self.device)
 
             self.model.eval()
+            ensemble_size = int(getattr(self.cfg.actor.model, "ensemble_size", 1))
             per_dataset: dict[str, dict[str, float]] = {}
             with torch.no_grad():
                 for ds_name, loader in self.eval_data_loaders:
                     batch_metrics: list[dict[str, float]] = []
                     for batch in loader:
                         observation, labels = self._prepare_input(batch)
-                        with self.amp_context:
-                            result = self.model(observation=observation, labels=labels)
-                        batch_metrics.append(self._metrics_from_output(result, labels))
+                        if ensemble_size > 1:
+                            metrics = self._eval_batch_ensemble(
+                                observation, labels, ensemble_size
+                            )
+                        else:
+                            metrics = self._eval_batch_single(observation, labels)
+                        batch_metrics.append(metrics)
                     if not batch_metrics:
                         continue
-                    agg: dict[str, list[float]] = {}
-                    for m in batch_metrics:
-                        for k, v in m.items():
-                            agg.setdefault(k, []).append(v)
-                    per_dataset[ds_name] = {k: sum(v) / len(v) for k, v in agg.items()}
+                    per_dataset[ds_name] = self._mean_metrics(batch_metrics)
 
             if not per_dataset:
                 return {}
@@ -551,6 +929,18 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             return final
 
     def set_global_step(self, step: int):
+        """Update the current epoch so the sampler reshuffles on rollover.
+
+        A global training step consumes ``grad_accum × ensemble_size``
+        loader batches (see :meth:`build_dataloader`'s per-member note):
+        the single-model path consumes ``grad_accum`` batches while the
+        ensemble path runs the same grad-accum loop once per member.
+        Both factors are folded into ``batches_per_step`` so epoch
+        rollover — and the resulting ``DistributedSampler.set_epoch``
+        reshuffle — fires at the correct global step in either mode.
+        Single model (``ensemble_size=1``) reduces to the original
+        ``loader_len // grad_accum`` calculation.
+        """
         self.global_step = step
         loader_len = len(self.data_loader)
         if loader_len == 0:
@@ -560,7 +950,11 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             // self.cfg.actor.micro_batch_size
             // self._world_size
         )
-        steps_per_epoch = max(1, loader_len // grad_accum)
+        ensemble_size = max(
+            1, int(getattr(self.cfg.actor.model, "ensemble_size", 1))
+        )
+        batches_per_step = grad_accum * ensemble_size
+        steps_per_epoch = max(1, loader_len // batches_per_step)
         new_epoch = step // steps_per_epoch
         current = getattr(self, "_current_epoch", -1)
         if current != new_epoch:

@@ -44,7 +44,7 @@ from __future__ import annotations
 import io
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -53,39 +53,6 @@ import torch
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class Trajectory:
-    """In-memory success-demo trajectory, used by the in-memory source.
-
-    Attributes:
-        frames: ``(T, H, W, 3)`` uint8 frames.
-        states: Optional ``(T, d_state)`` float32 proprio states.
-        language: Task instruction (single-task experiments).
-        metadata: Free-form dict (episode id, success flag, etc.).
-    """
-
-    frames: np.ndarray
-    states: Optional[np.ndarray] = None
-    language: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if self.frames.ndim != 4 or self.frames.shape[-1] != 3:
-            raise ValueError(
-                f"frames must have shape (T, H, W, 3), got {self.frames.shape}"
-            )
-        if self.states is not None:
-            if self.states.shape[0] != self.frames.shape[0]:
-                raise ValueError(
-                    f"states length ({self.states.shape[0]}) does not match "
-                    f"frames length ({self.frames.shape[0]})"
-                )
-
-    @property
-    def length(self) -> int:
-        return int(self.frames.shape[0])
 
 
 # Camera-view aliases tried against raw LeRobot sample dicts. Callers pass
@@ -167,7 +134,7 @@ def _to_float32_1d(state: Any, *, max_dim: Optional[int] = None) -> np.ndarray:
 
 
 class TrajectorySource:
-    """Minimal interface shared by the LeRobot and in-memory sources."""
+    """Minimal interface that any concrete trajectory source must satisfy."""
 
     def num_episodes(self) -> int:
         raise NotImplementedError
@@ -192,58 +159,27 @@ class TrajectorySource:
         """
         return None
 
-
-class _InMemorySource(TrajectorySource):
-    """In-memory source backed by a list of :class:`Trajectory` objects.
-
-    Every trajectory carries a single image stream under the distinguished
-    camera key ``"image"``. Other camera keys resolve to ``None`` → zero
-    placeholder + mask=False at the processor level.
-    """
-
-    _DEFAULT_CAMERA = "image"
-
-    def __init__(self, trajectories: Sequence[Trajectory]) -> None:
-        if not trajectories:
-            raise ValueError("trajectories must be a non-empty sequence")
-        self.trajectories = list(trajectories)
-
-    def num_episodes(self) -> int:
-        return len(self.trajectories)
-
-    def episode_length(self, episode: int) -> int:
-        return self.trajectories[episode].length
-
-    def get_view(
-        self, episode: int, frame: int, camera_key: str
-    ) -> Optional[np.ndarray]:
-        if camera_key != self._DEFAULT_CAMERA:
-            return None
-        return self.trajectories[episode].frames[frame]
-
-    def get_state(self, episode: int, frame: int, state_key: str) -> np.ndarray:
-        del state_key
-        traj = self.trajectories[episode]
-        if traj.states is None:
-            raise KeyError("trajectory has no states")
-        return traj.states[frame]
-
-    def get_prompt(self, episode: int, frame: int) -> Optional[str]:
-        del frame
-        lang = self.trajectories[episode].language
-        return lang if lang else None
+    def episode_is_success(self, episode: int) -> bool:
+        """Return whether the episode should be treated as successful."""
+        raise NotImplementedError
 
 
 class _LeRobotSource(TrajectorySource):
     """LeRobot-backed source with lazy per-frame access."""
 
-    def __init__(self, dataset_path: str) -> None:
+    def __init__(
+        self,
+        dataset_path: str,
+        *,
+        only_success: bool = True,
+        dataset_type: str,
+    ) -> None:
         try:
-            from lerobot.datasets.lerobot_dataset import (  # noqa: E501
+            from lerobot.common.datasets.lerobot_dataset import (  # noqa: E501
                 LeRobotDataset,
                 LeRobotDatasetMetadata,
             )
-            from lerobot.datasets.utils import hf_transform_to_torch
+            from lerobot.common.datasets.utils import hf_transform_to_torch
         except ImportError:  # pragma: no cover — older lerobot layout
             from lerobot.common.datasets.lerobot_dataset import (  # noqa: E501
                 LeRobotDataset,
@@ -253,10 +189,23 @@ class _LeRobotSource(TrajectorySource):
         from PIL import Image as PILImage
 
         local_path = Path(dataset_path).absolute()
+        self._dataset_label = str(local_path)
         self.meta = LeRobotDatasetMetadata(local_path.name, root=local_path)
         self.base = LeRobotDataset(
             local_path.name, root=local_path, download_videos=False
         )
+        self._only_success = bool(only_success)
+        self.dataset_type = dataset_type
+
+        eps = self.base.episode_data_index
+        self._ep_starts = [int(x) for x in eps["from"].tolist()]
+        self._ep_ends = [int(x) for x in eps["to"].tolist()]
+        if self.dataset_type == "sft":
+            self._episode_success = None
+        else:
+            self._episode_success = (
+                self._scan_episode_successes() if only_success else None
+            )
 
         def _decoding_transform(batch: dict) -> dict:
             for key in list(batch.keys()):
@@ -266,10 +215,6 @@ class _LeRobotSource(TrajectorySource):
             return hf_transform_to_torch(batch)
 
         self.base.hf_dataset.set_transform(_decoding_transform)
-
-        eps = self.base.episode_data_index
-        self._ep_starts = [int(x) for x in eps["from"].tolist()]
-        self._ep_ends = [int(x) for x in eps["to"].tolist()]
 
         self._tasks: dict[int, str] = self._load_tasks(local_path)
 
@@ -307,6 +252,50 @@ class _LeRobotSource(TrajectorySource):
         global_idx = self._ep_starts[episode] + int(frame)
         return self.base[global_idx]
 
+    @staticmethod
+    def _coerce_success_flag(raw: Any) -> bool:
+        """Normalise a raw per-frame success flag to Python bool."""
+        if isinstance(raw, torch.Tensor):
+            raw = raw.item()
+        if isinstance(raw, np.ndarray):
+            raw = raw.reshape(-1)[0].item()
+        if isinstance(raw, (list, tuple)):
+            if len(raw) != 1:
+                raise ValueError(f"Expected scalar success flag, got {raw!r}")
+            raw = raw[0]
+        return bool(raw)
+
+    def _scan_episode_successes(self) -> list[bool]:
+        """Read one representative frame row per episode from ``is_success``."""
+        raw_dataset = self.base.hf_dataset
+        if "is_success" not in raw_dataset.column_names:
+            raise ValueError(
+                "PairDataset(dataset_type='rollout', only_success=True) "
+                "requires the LeRobot dataset to contain an 'is_success' "
+                "column on representative frame rows."
+            )
+
+        # Read is_success directly from the Arrow table, bypassing
+        # hf_dataset.set_transform. The transform loads every column and runs
+        # hf_transform_to_torch, which crashes on non-image dict columns
+        # (e.g. lerobot Video struct dicts that lack a "bytes" key).
+        is_success_column = raw_dataset.data.column("is_success")
+
+        episode_success: list[bool] = [
+            self._coerce_success_flag(is_success_column[int(start)].as_py())
+            for start, _end in zip(self._ep_starts, self._ep_ends)
+        ]
+
+        num_success = sum(bool(v) for v in episode_success)
+        logger.info(
+            "Scanned %d episode(s) in %s via one frame per episode from is_success; "
+            "%d marked successful",
+            len(episode_success),
+            self._dataset_label,
+            num_success,
+        )
+        return episode_success
+
     def get_view(
         self, episode: int, frame: int, camera_key: str
     ) -> Optional[np.ndarray]:
@@ -322,17 +311,42 @@ class _LeRobotSource(TrajectorySource):
         raw = _resolve_alias(sample, state_key, _STATE_KEY_ALIASES)
         return _to_float32_1d(raw)
 
-    def get_prompt(self, episode: int, frame: int) -> Optional[str]:
-        if not self._tasks:
-            return None
+    def get_prompt(self, episode: int, frame: int) -> str:
         sample = self._sample(episode, frame)
-        if "task" in sample and isinstance(sample["task"], str) and sample["task"]:
-            return sample["task"]
+        task = sample.get("task")
+        if isinstance(task, str) and task:
+            return task
         ti = sample.get("task_index")
         if ti is None:
-            return None
-        ti = ti.item() if isinstance(ti, torch.Tensor) else int(ti)
-        return self._tasks.get(int(ti))
+            raise RuntimeError(
+                f"PairDataset: sample for episode={episode} frame={frame} in "
+                f"{self._dataset_label!r} has no 'task' string and no "
+                "'task_index' field; cannot resolve per-episode task instruction."
+            )
+        ti_int = ti.item() if isinstance(ti, torch.Tensor) else int(ti)
+        if not self._tasks:
+            raise RuntimeError(
+                f"PairDataset: sample for episode={episode} frame={frame} in "
+                f"{self._dataset_label!r} has task_index={ti_int} but the dataset "
+                "has no meta/tasks.jsonl (or meta/tasks.parquet) to resolve the "
+                "instruction."
+            )
+        prompt = self._tasks.get(int(ti_int))
+        if not prompt:
+            raise RuntimeError(
+                f"PairDataset: episode={episode} frame={frame} in "
+                f"{self._dataset_label!r} has task_index={ti_int} but it is not "
+                f"present in meta/tasks.jsonl "
+                f"(available indices: {sorted(self._tasks.keys())})."
+            )
+        return prompt
+
+    def episode_is_success(self, episode: int) -> bool:
+        if self.dataset_type == "sft":
+            return True
+        if self._episode_success is None:
+            return True
+        return bool(self._episode_success[episode])
 
 
 # ---------------------------------------------------------------------------
@@ -344,68 +358,85 @@ class PairDataset(Dataset):
     """Yields ``(frame_t, frame_{t+k})`` pairs with multi-view per frame.
 
     Args:
-        dataset_path: LeRobot dataset path (mutually exclusive with
-            ``trajectories``).
-        trajectories: In-memory trajectory list (mutually exclusive with
-            ``dataset_path``).
+        dataset_path: LeRobot dataset path.
         camera_keys: Camera view names to load per frame. These match the
             processor's ``image_keys`` — the collator feeds images under
             exactly these keys, and the processor fills any missing ones
             with zero placeholders (mask=False). Default follows the
             evorl convention: ``("base_0_rgb", "left_wrist_0_rgb",
             "right_wrist_0_rgb")``.
-        prompt: Fallback task instruction used only when the source does
-            not provide a per-episode instruction (LeRobot
-            ``meta/tasks.jsonl`` for :class:`_LeRobotSource`,
-            ``Trajectory.language`` for :class:`_InMemorySource`). If the
-            source yields a non-empty instruction it takes precedence.
-            Leaving this ``None`` turns a missing instruction into a hard
-            error.
         k: Forward pair stride.
         include_state: If ``True``, samples carry ``state`` (proprio at
             ``t``) and ``state_tk`` (reserved).
         state_max_dim: Pad / truncate state to this dim.
         state_key: Fuzzy LeRobot state alias.
+        dataset_type: Must be explicitly provided and be either ``"sft"``
+            or ``"rollout"``. ``sft`` datasets are treated as all-success
+            episodes, so they do not require an ``is_success`` column.
+        only_success: Must be explicitly provided and currently must be
+            ``True``. Keeps only episodes whose per-frame ``is_success``
+            column marks the episode as successful. For LeRobot datasets
+            this checks one representative frame row per episode rather
+            than relying on episode-level metadata files.
         min_episode_length: Optional override for the minimum-length
             floor (default ``k + 1``).
     """
 
     def __init__(
         self,
-        dataset_path: Optional[str] = None,
+        dataset_path: str,
         *,
-        trajectories: Optional[Sequence[Trajectory]] = None,
         camera_keys: Sequence[str] = (
             "base_0_rgb",
             "left_wrist_0_rgb",
             "right_wrist_0_rgb",
         ),
-        prompt: Optional[str] = None,
         k: int = 4,
         include_state: bool = False,
         state_max_dim: Optional[int] = None,
         state_key: str = "state",
+        dataset_type: Optional[str] = None,
+        only_success: Optional[bool] = None,
         min_episode_length: Optional[int] = None,
     ) -> None:
-        if (dataset_path is None) == (trajectories is None):
-            raise ValueError("Provide exactly one of dataset_path / trajectories.")
-
         self.camera_keys: tuple[str, ...] = tuple(camera_keys)
         if not self.camera_keys:
             raise ValueError("camera_keys must be non-empty")
-        self.prompt = prompt
         self.k = int(k)
         if self.k < 1:
             raise ValueError(f"k must be >= 1, got {self.k}")
         self.include_state = bool(include_state)
         self.state_max_dim = state_max_dim
         self.state_key = state_key
+        self.source_name = str(dataset_path)
+        if dataset_type is None:
+            raise ValueError(
+                "PairDataset requires an explicit dataset_type argument "
+                "('sft' or 'rollout')."
+            )
+        self.dataset_type = str(dataset_type).lower()
+        if self.dataset_type not in ("sft", "rollout"):
+            raise ValueError(
+                f"PairDataset dataset_type must be 'sft' or 'rollout', "
+                f"got {dataset_type!r}."
+            )
+        if only_success is None:
+            raise ValueError(
+                "PairDataset requires an explicit only_success argument. "
+                "Set only_success=true."
+            )
+        self.only_success = bool(only_success)
+        if not self.only_success:
+            raise ValueError(
+                "PairDataset currently only supports only_success=True. "
+                "Please remove the override or set only_success=true."
+            )
 
-        if dataset_path is not None:
-            self._source: TrajectorySource = _LeRobotSource(dataset_path)
-        else:
-            assert trajectories is not None
-            self._source = _InMemorySource(trajectories)
+        self._source = _LeRobotSource(
+            dataset_path,
+            only_success=self.only_success,
+            dataset_type=self.dataset_type,
+        )
 
         # Default floor: any episode with at least 2 frames can form a pair
         # (t=0, t+k clamped to T-1). Yamls can raise this if they want to
@@ -413,16 +444,17 @@ class PairDataset(Dataset):
         if min_episode_length is None:
             min_episode_length = 2
         self._min_episode_length = int(min_episode_length)
-
         total_eps = self._source.num_episodes()
         self._eligible = [
             ep
             for ep in range(total_eps)
             if self._source.episode_length(ep) >= self._min_episode_length
+            and (not self.only_success or self._source.episode_is_success(ep))
         ]
         if not self._eligible:
             raise ValueError(
-                f"No episodes of length >= {self._min_episode_length} found "
+                f"No eligible episodes found with length >= {self._min_episode_length} "
+                f"and only_success={self.only_success} "
                 f"(dataset has {total_eps} episodes)."
             )
 
@@ -432,22 +464,27 @@ class PairDataset(Dataset):
         # to T_ep - 1 (boundary pair, stride < k). Cumulative sum lets
         # __getitem__ map a flat index to (eligible-slot, t) in
         # O(log |eligible|) via searchsorted.
-        counts = np.array(
+        pair_positions_per_episode = np.array(
             [self._source.episode_length(ep) - 1 for ep in self._eligible],
             dtype=np.int64,
         )
-        self._position_cumsum = np.cumsum(counts)
-        self._total_positions = int(self._position_cumsum[-1])
+        self._pair_position_ends = np.cumsum(pair_positions_per_episode)
+        # Total number of distinct temporal anchors before we duplicate each
+        # anchor into its positive and negative training samples.
+        self._num_pair_positions = int(self._pair_position_ends[-1])
 
         logger.info(
-            "PairDataset: source=%s, episodes=%d eligible=%d, k=%d, "
-            "total_positions=%d, include_state=%s, camera_keys=%s",
-            "lerobot" if dataset_path else "in-memory",
+            "PairDataset: dataset_path=%s, episodes=%d eligible=%d, k=%d, "
+            "total_positions=%d, include_state=%s, dataset_type=%s, "
+            "only_success=%s, camera_keys=%s",
+            self.source_name,
             total_eps,
             len(self._eligible),
             self.k,
-            self._total_positions,
+            self._num_pair_positions,
             self.include_state,
+            self.dataset_type,
+            self.only_success,
             self.camera_keys,
         )
 
@@ -464,8 +501,86 @@ class PairDataset(Dataset):
     def set_epoch(self, epoch: int) -> None:
         del epoch  # no RNG state, retained for DataLoader wrapper compat
 
+    @property
+    def num_pair_positions(self) -> int:
+        """Number of distinct ``(episode, t)`` anchors before label duplication."""
+        return self._num_pair_positions
+
     def __len__(self) -> int:
-        return 2 * self._total_positions
+        # Each temporal anchor contributes two labeled samples:
+        #   positive: (t, t+k)
+        #   negative: (t+k, t)
+        return 2 * self._num_pair_positions
+
+    def _decode_sample_index(self, idx: int) -> tuple[int, bool]:
+        """Map a flat dataset index to ``(pair_position, is_positive)``."""
+        if idx < 0:
+            idx += len(self)
+        if not (0 <= idx < len(self)):
+            raise IndexError(idx)
+
+        pair_position = idx // 2
+        is_positive = (idx % 2) == 0
+        return pair_position, is_positive
+
+    def _resolve_pair_position(self, pair_position: int) -> tuple[int, int, int]:
+        """Map a pair-position index to ``(episode, t, t_plus_k)``."""
+        episode_slot = int(
+            np.searchsorted(self._pair_position_ends, pair_position, side="right")
+        )
+        prev_episode_end = (
+            int(self._pair_position_ends[episode_slot - 1]) if episode_slot > 0 else 0
+        )
+        episode = int(self._eligible[episode_slot])
+        t = int(pair_position - prev_episode_end)
+        # Boundary clamp: when t+k overruns the episode, use the last
+        # available frame as the second slot. Stride degrades to T-1-t < k.
+        t_plus_k = min(t + self.k, self._source.episode_length(episode) - 1)
+        return episode, t, t_plus_k
+
+    def _resolve_prompt(self, episode: int, frame_idx: int) -> str:
+        """Return the per-sample task instruction; raises if missing."""
+        return self._source.get_prompt(episode, frame_idx)
+
+    def _build_sample(
+        self,
+        *,
+        episode: int,
+        frame_idx_t: int,
+        frame_idx_tk: int,
+        prompt: str,
+        label: float,
+    ) -> dict[str, Any]:
+        """Assemble the sample dict for a single labeled frame pair."""
+        views_t, mask_t = self._load_views(episode, frame_idx_t)
+        views_tk, mask_tk = self._load_views(episode, frame_idx_tk)
+
+        sample: dict[str, Any] = {
+            "image_t": views_t,
+            "image_tk": views_tk,
+            "image_mask_t": mask_t,
+            "image_mask_tk": mask_tk,
+            "prompt": prompt,
+            "label": float(label),
+            "episode": int(episode),
+            "frame_idx_t": int(frame_idx_t),
+            "frame_idx_tk": int(frame_idx_tk),
+            "source_name": self.source_name,
+        }
+
+        if self.include_state:
+            state_t = _to_float32_1d(
+                self._source.get_state(episode, frame_idx_t, self.state_key),
+                max_dim=self.state_max_dim,
+            )
+            state_tk = _to_float32_1d(
+                self._source.get_state(episode, frame_idx_tk, self.state_key),
+                max_dim=self.state_max_dim,
+            )
+            sample["state"] = state_t  # consumed by state-in-prompt branch
+            sample["state_tk"] = state_tk  # reserved for future extensions
+
+        return sample
 
     def _load_views(
         self, episode: int, frame_idx: int
@@ -482,73 +597,26 @@ class PairDataset(Dataset):
         return views, masks
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        if idx < 0:
-            idx += len(self)
-        if not (0 <= idx < len(self)):
-            raise IndexError(idx)
-
-        is_positive = (idx % 2) == 0
-        pos = idx // 2
-        slot = int(np.searchsorted(self._position_cumsum, pos, side="right"))
-        prev = int(self._position_cumsum[slot - 1]) if slot > 0 else 0
-        episode = int(self._eligible[slot])
-        t = int(pos - prev)
-        # Boundary clamp: when t+k overruns the episode, use the last
-        # available frame as the second slot. Stride degrades to T-1-t < k.
-        t_plus_k = min(t + self.k, self._source.episode_length(episode) - 1)
-
-        views_t, mask_t = self._load_views(episode, t)
-        views_tk, mask_tk = self._load_views(episode, t_plus_k)
-
-        prompt = self._source.get_prompt(episode, t)
-        if not prompt:
-            if self.prompt is None:
-                raise RuntimeError(
-                    f"No per-episode task instruction found for episode={episode} "
-                    f"(dataset has no tasks.jsonl / empty language) and no fallback "
-                    "`prompt` was provided to PairDataset."
-                )
-            prompt = self.prompt
-
+        pair_position, is_positive = self._decode_sample_index(idx)
+        episode, t, t_plus_k = self._resolve_pair_position(pair_position)
+        prompt = self._resolve_prompt(episode, t)
         # Positive: (t, t+k). Negative: swap the two slots so the "later"
         # frame in original time occupies image_t — the model sees what
         # looks like a forward pair but the motion is reversed.
         if is_positive:
-            slot_t_views, slot_t_mask = views_t, mask_t
-            slot_tk_views, slot_tk_mask = views_tk, mask_tk
             frame_idx_t, frame_idx_tk = t, t_plus_k
             label = 1.0
         else:
-            slot_t_views, slot_t_mask = views_tk, mask_tk
-            slot_tk_views, slot_tk_mask = views_t, mask_t
             frame_idx_t, frame_idx_tk = t_plus_k, t
             label = -1.0
 
-        sample: dict[str, Any] = {
-            "image_t": slot_t_views,
-            "image_tk": slot_tk_views,
-            "image_mask_t": slot_t_mask,
-            "image_mask_tk": slot_tk_mask,
-            "prompt": prompt,
-            "label": float(label),
-            "episode": int(episode),
-            "frame_idx_t": int(frame_idx_t),
-            "frame_idx_tk": int(frame_idx_tk),
-        }
-
-        if self.include_state:
-            state_t = _to_float32_1d(
-                self._source.get_state(episode, frame_idx_t, self.state_key),
-                max_dim=self.state_max_dim,
-            )
-            state_tk = _to_float32_1d(
-                self._source.get_state(episode, frame_idx_tk, self.state_key),
-                max_dim=self.state_max_dim,
-            )
-            sample["state"] = state_t  # consumed by state-in-prompt branch
-            sample["state_tk"] = state_tk  # reserved for future extensions
-
-        return sample
+        return self._build_sample(
+            episode=episode,
+            frame_idx_t=frame_idx_t,
+            frame_idx_tk=frame_idx_tk,
+            prompt=prompt,
+            label=label,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +670,7 @@ ValueDataCollator`. Runs the evorl :class:`Pistar06ValueProcessor` **twice**
         for cam in sorted(camera_keys):
             frames: list[np.ndarray] = []
             mask_vec: list[bool] = []
-            h, w = 0, 0
+            shapes: list[tuple[int, ...]] = []
             for ex in examples:
                 v = ex[images_key].get(cam)
                 if v is None:
@@ -610,13 +678,40 @@ ValueDataCollator`. Runs the evorl :class:`Pistar06ValueProcessor` **twice**
                     mask_vec.append(False)
                 else:
                     frames.append(v)
-                    h, w = v.shape[0], v.shape[1]
+                    shapes.append(tuple(int(dim) for dim in v.shape))
                     mask_vec.append(bool(ex[masks_key].get(cam, True)))
+
+            unique_shapes = sorted(set(shapes))
+            if len(unique_shapes) > 1:
+                shape_examples = [
+                    {
+                        "source": ex.get("source_name", "unknown"),
+                        "episode": ex.get("episode"),
+                        "frame_idx_t": ex.get("frame_idx_t"),
+                        "frame_idx_tk": ex.get("frame_idx_tk"),
+                        "shape": None
+                        if ex[images_key].get(cam) is None
+                        else tuple(int(dim) for dim in ex[images_key][cam].shape),
+                    }
+                    for ex in examples
+                ]
+                raise ValueError(
+                    "BinaryPairDataCollator saw incompatible raw image shapes "
+                    f"for camera={cam!r} at {images_key!r}: {unique_shapes}. "
+                    "PairDataset assumes camera tensors are already shape-aligned; "
+                    "this usually means your train batch mixed datasets with "
+                    "different raw resolutions for the same camera key. "
+                    f"Examples: {shape_examples}"
+                )
+
+            if unique_shapes:
+                h, w = unique_shapes[0][:2]
+            else:
+                h, w = 1, 1
+
             # Replace None entries with zero placeholders matching the first
             # real frame's spatial size. If no real frame exists for this
             # camera across the whole batch, fall back to 1x1.
-            if h == 0 or w == 0:
-                h, w = 1, 1
             placeholder = np.zeros((h, w, 3), dtype=np.uint8)
             stacked = torch.from_numpy(
                 np.stack([f if f is not None else placeholder for f in frames])
@@ -815,7 +910,7 @@ def sample_time_counter_diagnosis_batch(
         views_a_tk, mask_a_tk = _collect_views(ep_a, t + k)
         views_b_tk, mask_b_tk = _collect_views(ep_b, t + k)
 
-        prompt_a = source.get_prompt(ep_a, t) or dataset.prompt or "perform the task"
+        prompt_a = source.get_prompt(ep_a, t)
         base = {
             "prompt": prompt_a,
             "label": 1.0,
@@ -861,87 +956,6 @@ def sample_time_counter_diagnosis_batch(
             shuffled[-1]["state_tk"] = sb_tk
 
     return {"normal": normal, "shuffled": shuffled}
-
-
-# ---------------------------------------------------------------------------
-# In-process tests
-# ---------------------------------------------------------------------------
-
-
-def _synthetic_trajectory(length: int, rng: np.random.Generator) -> Trajectory:
-    frames = rng.integers(low=0, high=256, size=(length, 8, 8, 3), dtype=np.uint8)
-    states = rng.standard_normal(size=(length, 4)).astype(np.float32)
-    return Trajectory(frames=frames, states=states, language="demo")
-
-
-def _test_pair_dataset_balance_and_shapes() -> None:
-    rng = np.random.default_rng(0)
-    T = 60
-    trajs = [_synthetic_trajectory(T, rng) for _ in range(6)]
-
-    k = 4
-    ds = PairDataset(
-        trajectories=trajs,
-        camera_keys=("image",),  # the in-memory source only owns "image"
-        prompt="demo",
-        k=k,
-        include_state=True,
-        state_max_dim=4,
-    )
-
-    expected_total = sum(T - 1 for _ in trajs)
-    assert len(ds) == 2 * expected_total, (len(ds), expected_total)
-
-    pos, neg, boundary = 0, 0, 0
-    for i in range(len(ds)):
-        s = ds[i]
-        assert s["image_t"]["image"].shape == (8, 8, 3), s["image_t"]["image"].shape
-        assert s["image_tk"]["image"].shape == (8, 8, 3), s["image_tk"]["image"].shape
-        assert s["image_mask_t"]["image"] is True
-        assert s["image_mask_tk"]["image"] is True
-        assert s["state"].shape == (4,)
-        assert s["state_tk"].shape == (4,)
-        a, b = s["frame_idx_t"], s["frame_idx_tk"]
-        assert 0 <= a < T and 0 <= b < T, (a, b)
-        stride = abs(b - a)
-        assert 1 <= stride <= k, stride
-        if s["label"] > 0:
-            pos += 1
-            assert b > a, (a, b)
-        else:
-            neg += 1
-            assert b < a, (a, b)
-        if stride < k:
-            boundary += 1
-    assert pos == neg == len(ds) // 2, (pos, neg, len(ds))
-    # k-1 boundary t per episode × num_episodes × 2 (pos+neg)
-    expected_boundary = 6 * (k - 1) * 2
-    assert boundary == expected_boundary, (boundary, expected_boundary)
-
-
-def _test_determinism() -> None:
-    rng = np.random.default_rng(0)
-    trajs = [_synthetic_trajectory(40, rng) for _ in range(3)]
-
-    ds = PairDataset(
-        trajectories=trajs,
-        camera_keys=("image",),
-        prompt="demo",
-        k=3,
-    )
-    first = [(ds[i]["episode"], ds[i]["frame_idx_t"]) for i in range(len(ds))]
-    repeat = [(ds[i]["episode"], ds[i]["frame_idx_t"]) for i in range(len(ds))]
-    assert first == repeat
-
-
-def _run_tests() -> None:
-    _test_pair_dataset_balance_and_shapes()
-    _test_determinism()
-    print("pair_dataset.py: all tests passed")
-
-
-if __name__ == "__main__":
-    _run_tests()
 
 
 __all__ = [

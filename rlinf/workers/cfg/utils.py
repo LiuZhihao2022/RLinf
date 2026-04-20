@@ -58,7 +58,7 @@ def cast_image_features(hf_dataset):
             needs_cast = True
 
     if needs_cast:
-        from lerobot.datasets.utils import hf_transform_to_torch
+        from lerobot.common.datasets.utils import hf_transform_to_torch
 
         hf_dataset = hf_dataset.cast(new_features)
         hf_dataset.set_transform(hf_transform_to_torch)
@@ -85,6 +85,7 @@ class AdvantagePreservingDataset:
         base_dataset: Any,
         transformed_dataset: Any,
         advantages_lookup: dict[tuple[int, int], bool] | None = None,
+        constant_advantage: bool | None = None,
     ):
         """Initialize AdvantagePreservingDataset.
 
@@ -97,10 +98,13 @@ class AdvantagePreservingDataset:
             advantages_lookup: Optional pre-loaded advantage lookup from
                 meta/advantages_{tag}.parquet. If provided, advantage is read
                 from this lookup instead of from the data parquet.
+            constant_advantage: Optional constant advantage label applied to
+                every sample. This is useful for expert-only SFT datasets that
+                should always be treated as positive guidance examples.
         """
         self._transformed_dataset = transformed_dataset
         self._advantage_by_index = self._build_advantage_index(
-            base_dataset, advantages_lookup
+            base_dataset, advantages_lookup, constant_advantage
         )
         # Keep base_dataset only as fallback when pre-building fails
         self._base_dataset = base_dataset if self._advantage_by_index is None else None
@@ -126,6 +130,7 @@ class AdvantagePreservingDataset:
         self,
         base_dataset: Any,
         advantages_lookup: dict[tuple[int, int], bool] | None,
+        constant_advantage: bool | None,
     ) -> dict[int, bool] | None:
         """Build mapping from sample index to advantage value.
 
@@ -136,6 +141,9 @@ class AdvantagePreservingDataset:
             Dict mapping sample index -> advantage (bool), or None if
             the HF dataset is not accessible (falls back to slow path).
         """
+        if constant_advantage is not None:
+            return {i: bool(constant_advantage) for i in range(len(base_dataset))}
+
         hf_dataset = self._get_hf_dataset(base_dataset)
         if hf_dataset is None:
             logger.warning(

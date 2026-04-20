@@ -122,6 +122,23 @@ def _extract_hidden_size(model: nn.Module) -> int:
     raise ValueError(f"Cannot infer hidden size for model config type {type(config)}")
 
 
+def _module_parameter_dtype(module: nn.Module, fallback: torch.dtype) -> torch.dtype:
+    """Return the effective forward dtype for ``module`` when possible."""
+    mixed_precision = getattr(module, "mixed_precision", None)
+    if mixed_precision is not None and mixed_precision.param_dtype is not None:
+        return mixed_precision.param_dtype
+
+    parameter = next(module.parameters(), None)
+    if parameter is not None:
+        return parameter.dtype
+
+    buffer = next(module.buffers(), None)
+    if buffer is not None:
+        return buffer.dtype
+
+    return fallback
+
+
 def _extract_vision_feature_size(model: nn.Module) -> int:
     config = getattr(model, "config", None)
     if config is None:
@@ -310,7 +327,7 @@ class RewindArmBackbone(nn.Module):
 
     def _apply_siglip_normalisation(self, flat_images: Tensor) -> Tensor:
         """SigLIP mean/std normalisation on a flat ``[N, C, H, W]`` tensor.
-        # TODO: check是否已经resize成需要的shape了？
+
         The collator's processor has already resized to native resolution
         and converted to ``[0, 1]`` float, so this step only needs to
         subtract ``image_mean`` and divide by ``image_std``. A safety
@@ -398,7 +415,8 @@ class RewindArmBackbone(nn.Module):
         # Per-frame concat preserves frame ordering ``(t, t+k)``.
         frames_concat = per_frame_image_features.reshape(bsize, -1)
         fused = torch.cat([frames_concat, language_feature], dim=-1)
-        return self.fusion_norm(fused)
+        fusion_dtype = _module_parameter_dtype(self.fusion_norm, fused.dtype)
+        return self.fusion_norm(fused.to(dtype=fusion_dtype))
 
     def _compute_features(
         self,
@@ -462,13 +480,14 @@ class RewindArmBackbone(nn.Module):
                 input_ids=input_ids, attention_mask=language_mask.long()
             )
 
-        # Match the evorl Pistar06 path: projectors / fusion_norm / value_head
-        # are fp32 storage and FSDP NO_SHARD + MixedPrecision does not cast
-        # their weights to bf16 at forward time. Feeding bf16 features into the
-        # fp32 Linear weights triggers a "mat1 and mat2 must have the same
-        # dtype" RuntimeError, so cast the encoder features to fp32 first.
-        feature_dtype = torch.float32
-        projected = self.image_projector(vision_feats.to(feature_dtype))
+        # Under plain eager, projector weights often stay fp32; under FSDP
+        # mixed precision they may be bf16/fp16. Always cast features to the
+        # receiving module's dtype so Linear/LayerNorm matmuls stay consistent.
+        image_projector_dtype = _module_parameter_dtype(
+            self.image_projector,
+            vision_feats.dtype,
+        )
+        projected = self.image_projector(vision_feats.to(dtype=image_projector_dtype))
         projected = projected.view(
             bsize, num_cameras, num_frames, self.cfg.fusion_hidden_dim
         )
@@ -481,7 +500,13 @@ class RewindArmBackbone(nn.Module):
         cam_counts = cam_mask_float.sum(dim=1).clamp_min(1.0)  # [B, Nf, 1]
         per_frame_features = projected_masked.sum(dim=1) / cam_counts  # [B, Nf, D]
 
-        lang = self.language_projector(lang_feat_raw.to(feature_dtype))
+        language_projector_dtype = _module_parameter_dtype(
+            self.language_projector,
+            lang_feat_raw.dtype,
+        )
+        lang = self.language_projector(
+            lang_feat_raw.to(dtype=language_projector_dtype)
+        )
         return self._fuse(per_frame_features, lang)
 
     def _check_shapes(

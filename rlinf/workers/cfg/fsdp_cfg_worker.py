@@ -131,7 +131,7 @@ class FSDPCfgWorker(FSDPSftWorker):
 
     def build_dataloader(self):
         """Build CFG dataloader with advantage-weighted sampling across datasets."""
-        import lerobot.datasets.lerobot_dataset as lerobot_dataset
+        import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
         import openpi.training.data_loader as openpi_data_loader
         import openpi.transforms as transforms
 
@@ -165,6 +165,7 @@ class FSDPCfgWorker(FSDPSftWorker):
             data_path = ds_config["dataset_path"]
             episodes = ds_config.get("episodes")
             weight = ds_config.get("weight", 1.0)
+            dataset_type = str(ds_config.get("type", "rollout")).lower()
 
             dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(data_path)
             base_dataset = lerobot_dataset.LeRobotDataset(
@@ -203,22 +204,35 @@ class FSDPCfgWorker(FSDPSftWorker):
                 base_dataset, transforms_list
             )
 
-            advantages_lookup = self._load_advantages_lookup(data_path, advantage_tag)
-            if self._rank == 0:
-                adv_filename = (
-                    f"advantages_{advantage_tag}.parquet"
-                    if advantage_tag
-                    else "advantages.parquet"
+            constant_advantage = None
+            advantages_lookup = None
+            if dataset_type == "sft":
+                constant_advantage = True
+                if self._rank == 0:
+                    self.log_info(
+                        f"Dataset {data_path} is type=sft; using constant "
+                        "advantage=True for all samples."
+                    )
+            else:
+                advantages_lookup = self._load_advantages_lookup(
+                    data_path, advantage_tag
                 )
-                self.log_info(
-                    f"Loaded advantages from "
-                    f"meta/{adv_filename} ({len(advantages_lookup)} entries)"
-                )
+                if self._rank == 0:
+                    adv_filename = (
+                        f"advantages_{advantage_tag}.parquet"
+                        if advantage_tag
+                        else "advantages.parquet"
+                    )
+                    self.log_info(
+                        f"Loaded advantages from "
+                        f"meta/{adv_filename} ({len(advantages_lookup)} entries)"
+                    )
 
             final_dataset = AdvantagePreservingDataset(
                 base_dataset=base_dataset,
                 transformed_dataset=transformed_dataset,
                 advantages_lookup=advantages_lookup,
+                constant_advantage=constant_advantage,
             )
 
             datasets_with_weights.append((final_dataset, weight))

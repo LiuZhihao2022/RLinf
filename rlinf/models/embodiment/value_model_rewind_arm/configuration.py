@@ -31,6 +31,49 @@ from typing import Optional
 
 from transformers import PretrainedConfig
 
+VALID_BINARY_VALUE_INFERENCE_MODES = ("mo", "wco", "uwo")
+
+
+def normalize_binary_value_inference_mode(mode: str) -> str:
+    """Normalise an ensemble inference mode string."""
+    mode_norm = str(mode).strip().lower()
+    if mode_norm not in VALID_BINARY_VALUE_INFERENCE_MODES:
+        raise ValueError(
+            f"inference_mode must be one of {VALID_BINARY_VALUE_INFERENCE_MODES}, "
+            f"got {mode!r}"
+        )
+    return mode_norm
+
+
+def validate_binary_value_ensemble_settings(
+    *,
+    ensemble_size: int,
+    inference_mode: str,
+    uwo_lambda: float,
+    micro_batch_size: Optional[int] = None,
+    global_batch_size: Optional[int] = None,
+) -> tuple[int, str, float]:
+    """Validate binary-value ensemble settings shared by training and inference.
+
+    ``micro_batch_size`` / ``global_batch_size`` are accepted for call-site
+    parity but are intentionally not constrained: per-member sequential
+    training treats both as the per-member batch (each member fetches its
+    own micro batches independently), so divisibility by ``ensemble_size``
+    is no longer required.
+    """
+    del micro_batch_size, global_batch_size  # accepted for backward compat
+
+    ensemble_size = int(ensemble_size)
+    if ensemble_size < 1:
+        raise ValueError("ensemble_size must be >= 1")
+
+    inference_mode = normalize_binary_value_inference_mode(inference_mode)
+    uwo_lambda = float(uwo_lambda)
+    if uwo_lambda < 0.0:
+        raise ValueError("uwo_lambda must be >= 0")
+
+    return ensemble_size, inference_mode, uwo_lambda
+
 
 class BinaryValueConfig(PretrainedConfig):
     """Configuration for the ARM + ReWiND :class:`BinaryValueCriticModel`.
@@ -54,6 +97,10 @@ class BinaryValueConfig(PretrainedConfig):
         dropout: float = 0.1,
         label_smoothing: float = 0.05,
         num_frames_per_pair: int = 2,
+        ensemble_size: int = 1,
+        inference_mode: str = "mo",
+        uwo_lambda: float = 1.0,
+        ensemble_head_seed_base: Optional[int] = None,
         # Runtime
         dtype: str = "bfloat16",
         precision: Optional[str] = None,
@@ -77,6 +124,12 @@ class BinaryValueConfig(PretrainedConfig):
         self.dropout = dropout
         self.label_smoothing = label_smoothing
         self.num_frames_per_pair = num_frames_per_pair
+        self.ensemble_size = int(ensemble_size)
+        self.inference_mode = normalize_binary_value_inference_mode(inference_mode)
+        self.uwo_lambda = float(uwo_lambda)
+        self.ensemble_head_seed_base = (
+            None if ensemble_head_seed_base is None else int(ensemble_head_seed_base)
+        )
 
         self.dtype = precision if precision is not None else dtype
         self.precision = self.dtype
@@ -112,6 +165,10 @@ class BinaryValueConfig(PretrainedConfig):
             )
         if self.num_frames_per_pair < 1:
             raise ValueError("num_frames_per_pair must be >= 1")
+        if self.ensemble_size < 1:
+            raise ValueError("ensemble_size must be >= 1")
+        if self.uwo_lambda < 0.0:
+            raise ValueError("uwo_lambda must be >= 0")
         if self.dtype not in {"bfloat16", "float32", "float16"}:
             raise ValueError(
                 f"dtype must be one of bfloat16/float32/float16, got {self.dtype}"
@@ -122,3 +179,14 @@ class BinaryValueConfig(PretrainedConfig):
             raise ValueError("max_state_dim must be > 0")
         if self.state_discretization_bins < 2:
             raise ValueError("state_discretization_bins must be >= 2")
+
+    def to_diff_dict(self) -> dict:
+        """Return a full config dict without instantiating an empty default config.
+
+        ``PretrainedConfig.to_diff_dict`` creates ``self.__class__()`` to compute
+        a diff against default values. That does not work here because
+        ``BinaryValueConfig`` intentionally requires non-empty backbone ids.
+        Returning the full config keeps HuggingFace save/load helpers working
+        for checkpoint metadata.
+        """
+        return self.to_dict()

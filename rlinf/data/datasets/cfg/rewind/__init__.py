@@ -17,7 +17,6 @@
 from .pair_dataset import (
     BinaryPairDataCollator,
     PairDataset,
-    Trajectory,
     TrajectorySource,
     sample_time_counter_diagnosis_batch,
 )
@@ -25,7 +24,6 @@ from .pair_dataset import (
 __all__ = [
     "BinaryPairDataCollator",
     "PairDataset",
-    "Trajectory",
     "TrajectorySource",
     "sample_time_counter_diagnosis_batch",
 ]

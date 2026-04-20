@@ -44,7 +44,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.distributed as dist
-from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
@@ -177,9 +177,16 @@ KEY_MAPPINGS = {
         "observation.images.wrist_cam": "observation/images/wrist_cam",
         "observation.state.tcp_pose": "observation/state/tcp_pose",
         "observation.state.gripper_pose": "observation/state/gripper_pose",
-        # Single-cam format (push_button style: image + state)
+        # Single-cam format (image + state)
         "observation.images.image": "observation/image",
         "image": "observation/image",
+        "state": "observation/state",
+        "task": "prompt",
+    },
+    "franka_co_train": {
+        # Single-cam + wrist format (image + wrist_image + state)
+        "image": "observation/image",
+        "wrist_image": "observation/wrist_image",
         "state": "observation/state",
         "task": "prompt",
     },
@@ -293,7 +300,22 @@ def _parse_value_model_kwargs(cfg: DictConfig) -> dict:
     if "train_data_paths" in data_cfg and len(data_cfg.train_data_paths) > 0:
         robot_type = data_cfg.train_data_paths[0].get("robot_type", robot_type)
 
-    return {
+    norm_stats = None
+    norm_stats_dir = data_cfg.get("norm_stats_dir", None)
+    if norm_stats_dir is not None:
+        from rlinf.models.embodiment.value_model.checkpoint_utils import (
+            load_norm_stats,
+        )
+
+        asset_id = data_cfg.get("asset_id", robot_type)
+        norm_stats = load_norm_stats(Path(norm_stats_dir), asset_id=asset_id)
+        logger.info(
+            "Loaded norm_stats from %s (asset_id=%s) for advantage computation",
+            norm_stats_dir,
+            asset_id,
+        )
+
+    kwargs = {
         "checkpoint_dir": checkpoint_path,
         "env_type": robot_type,
         "model_type": data_cfg.get("model_type", "pi05"),
@@ -305,6 +327,71 @@ def _parse_value_model_kwargs(cfg: DictConfig) -> dict:
         "siglip_path": model_cfg.get("siglip_path", None),
         "gemma3_path": model_cfg.get("gemma3_path", None),
     }
+    if norm_stats is not None:
+        kwargs["norm_stats"] = norm_stats
+    return kwargs
+
+
+def _parse_evorl_value_model_kwargs(cfg: DictConfig) -> dict:
+    """Extract Pistar06ValueCriticModel.from_checkpoint kwargs from Hydra config."""
+    checkpoint_path = cfg.advantage.value_checkpoint
+    if checkpoint_path is None:
+        raise ValueError("advantage.value_checkpoint must be specified")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    data_cfg = cfg.data
+    model_cfg = cfg.advantage.get("model", {})
+
+    robot_type = data_cfg.get("robot_type", "libero")
+    if "train_data_paths" in data_cfg and len(data_cfg.train_data_paths) > 0:
+        robot_type = data_cfg.train_data_paths[0].get("robot_type", robot_type)
+
+    # Load norm_stats from an explicit directory when the checkpoint does not
+    # bundle them (the FSDP value SFT worker does not save norm_stats into the
+    # checkpoint).  Without these, state-in-prompt normalization at inference
+    # time would silently differ from training.
+    norm_stats = None
+    norm_stats_dir = data_cfg.get("norm_stats_dir", None)
+    if norm_stats_dir is not None:
+        from rlinf.models.embodiment.value_model.checkpoint_utils import (
+            load_norm_stats,
+        )
+
+        asset_id = data_cfg.get("asset_id", robot_type)
+        norm_stats = load_norm_stats(Path(norm_stats_dir), asset_id=asset_id)
+        logger.info(
+            "Loaded norm_stats from %s (asset_id=%s) for advantage computation",
+            norm_stats_dir,
+            asset_id,
+        )
+
+    kwargs = {
+        "checkpoint_dir": checkpoint_path,
+        "env_type": robot_type,
+        "model_type": data_cfg.get("model_type", "pi05"),
+        "num_return_bins": model_cfg.get("num_bins", 201),
+        "return_min": model_cfg.get("v_min", -1.0),
+        "return_max": model_cfg.get("v_max", 0.0),
+        "tokenizer_path": model_cfg.get("tokenizer_path", None),
+        "vision_repo_id": model_cfg.get("vision_repo_id", None),
+        "language_repo_id": model_cfg.get("language_repo_id", None),
+        "fusion_hidden_dim": model_cfg.get("fusion_hidden_dim", 512),
+        "dropout": model_cfg.get("dropout", 0.1),
+        # State-in-prompt and interface compat fields — must match the values
+        # used during value SFT training so the model sees identical prompts.
+        "include_state_in_prompt": model_cfg.get("include_state_in_prompt", True),
+        "max_state_dim": model_cfg.get("max_state_dim", 32),
+        "state_discretization_bins": model_cfg.get(
+            "state_discretization_bins", 256
+        ),
+        "max_token_len": model_cfg.get("max_token_len", 200),
+        "action_dim": model_cfg.get("action_dim", 32),
+        "action_horizon": model_cfg.get("action_horizon", 50),
+    }
+    if norm_stats is not None:
+        kwargs["norm_stats"] = norm_stats
+    return kwargs
 
 
 def load_lerobot_dataset(
@@ -1021,9 +1108,24 @@ def main(cfg: DictConfig) -> None:
         logging.getLogger().setLevel(logging.WARNING)
 
     try:
-        value_model = ValueCriticModel.from_checkpoint(
-            **_parse_value_model_kwargs(cfg), device=device
-        )
+        # Dispatch on advantage.model.model_type so the same compute_advantages
+        # script can drive both ValueCriticModel and Pistar06ValueCriticModel
+        # checkpoints. Default ("value_model") preserves backward compat for
+        # existing YAMLs.
+        adv_model_cfg = cfg.advantage.get("model", {})
+        adv_model_type = adv_model_cfg.get("model_type", "value_model")
+        if adv_model_type == "value_model_evorl":
+            from rlinf.models.embodiment.value_model_evorl.modeling_critic import (
+                Pistar06ValueCriticModel,
+            )
+
+            value_model = Pistar06ValueCriticModel.from_checkpoint(
+                **_parse_evorl_value_model_kwargs(cfg), device=device
+            )
+        else:
+            value_model = ValueCriticModel.from_checkpoint(
+                **_parse_value_model_kwargs(cfg), device=device
+            )
 
         all_advantages = []
         dataset_results = {}
