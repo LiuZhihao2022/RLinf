@@ -18,8 +18,8 @@ Reads ``meta/advantages_{tag}.parquet`` produced by
 ``compute_advantages_ensemble.py`` and writes:
 
   Global plots (always written):
-    1. ``distribution.png``                — aggregated p(progress) histogram
-    2. ``members.png``                     — per-member p(progress) overlay
+    1. ``distribution.png``                — aggregated signed-progress histogram
+    2. ``members.png``                     — per-member signed-progress overlay
     3. ``uncertainty.png``                 — mean vs variance scatter
     4. ``positive_rate_per_episode.png``   — per-episode positive fraction
     5. ``timeline_episodes.png``           — 3x3 episode timeline grid
@@ -185,7 +185,7 @@ def load_threshold_from_mixture(dataset_path: Path, tag: str) -> float | None:
 
 
 def _stack_member_values(df: pd.DataFrame) -> np.ndarray:
-    """Return a [K, N] array of per-member p(progress)."""
+    """Return a [K, N] array of per-member signed-progress values in [-1, 1]."""
     rows = [np.asarray(row, dtype=np.float32) for row in df["member_values"].tolist()]
     if not rows:
         raise RuntimeError("Empty parquet — nothing to plot")
@@ -206,7 +206,7 @@ def plot_distribution(
     ax.hist(
         adv,
         bins=80,
-        range=(0.0, 1.0),
+        range=(-1.0, 1.0),
         color="steelblue",
         edgecolor="black",
         alpha=0.75,
@@ -227,10 +227,12 @@ def plot_distribution(
             linewidth=2.0,
             label=f"threshold = {threshold:.3f}  (positive: {n_pos}/{len(adv)})",
         )
-    ax.set_xlim(0.0, 1.0)
-    ax.set_xlabel("aggregated p(progress)  (= advantage_continuous, wco picks worst member)")
+    ax.set_xlim(-1.0, 1.0)
+    ax.set_xlabel(
+        "aggregated signed progress  (= advantage_continuous, wco picks worst member)"
+    )
     ax.set_ylabel("count")
-    ax.set_title(f"Aggregated p(progress) — {dataset_name}\ntag = {tag}")
+    ax.set_title(f"Aggregated signed progress — {dataset_name}\ntag = {tag}")
     ax.legend(loc="upper left")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -242,7 +244,7 @@ def plot_member_distributions(df: pd.DataFrame, out_path: Path, dataset_name: st
     members = _stack_member_values(df)  # [K, N]
     K = members.shape[0]
     fig, ax = plt.subplots(figsize=(8, 5))
-    bins = np.linspace(0.0, 1.0, 80)
+    bins = np.linspace(-1.0, 1.0, 80)
     colors = plt.get_cmap("tab10")(np.linspace(0, 1, max(K, 3)))
     for k in range(K):
         ax.hist(
@@ -253,14 +255,15 @@ def plot_member_distributions(df: pd.DataFrame, out_path: Path, dataset_name: st
             color=colors[k],
             label=f"member {k}  (mean={members[k].mean():.3f})",
         )
-    ax.set_xlabel("p(progress)")
+    ax.set_xlabel("signed progress")
     ax.set_ylabel("count")
     ax.set_title(
-        f"Per-member p(progress) distributions — {dataset_name}\ntag = {tag} (K = {K})"
+        f"Per-member signed-progress distributions — {dataset_name}\n"
+        f"tag = {tag} (K = {K})"
     )
     ax.legend(loc="upper left", fontsize=9)
     ax.grid(True, alpha=0.3)
-    ax.set_xlim(0.0, 1.0)
+    ax.set_xlim(-1.0, 1.0)
     fig.tight_layout()
     fig.savefig(out_path, dpi=120)
     plt.close(fig)
@@ -290,14 +293,14 @@ def plot_uncertainty_scatter(
     if threshold is not None:
         ax_main.axvline(threshold, color="orange", linestyle="--", linewidth=1.4)
         ax_top.axvline(threshold, color="orange", linestyle="--", linewidth=1.4)
-    ax_main.set_xlim(0.0, 1.0)
+    ax_main.set_xlim(-1.0, 1.0)
     ax_main.set_ylim(0.0, max(float(var.max()) * 1.05, 1e-4))
-    ax_main.set_xlabel("ensemble mean p(progress)")
-    ax_main.set_ylabel("ensemble variance of p(progress)")
+    ax_main.set_xlabel("ensemble mean signed progress")
+    ax_main.set_ylabel("ensemble variance of signed progress")
     ax_main.legend(loc="upper right", fontsize=9)
     ax_main.grid(True, alpha=0.3)
 
-    ax_top.hist(mean, bins=80, range=(0.0, 1.0), color="steelblue", alpha=0.75)
+    ax_top.hist(mean, bins=80, range=(-1.0, 1.0), color="steelblue", alpha=0.75)
     ax_top.set_ylabel("count")
     ax_top.tick_params(axis="x", labelbottom=False)
     ax_top.grid(True, alpha=0.3)
@@ -419,8 +422,8 @@ def plot_episode_timelines(
             f"episode {ep}  (T={len(sub)}, pos_rate={pos_rate:.2f})", fontsize=10
         )
         ax.set_xlabel("frame_index")
-        ax.set_ylabel("p(progress)")
-        ax.set_ylim(0.0, 1.0)
+        ax.set_ylabel("signed progress")
+        ax.set_ylim(-1.0, 1.0)
         ax.grid(True, alpha=0.3)
         if ax_idx == 0:
             ax.legend(loc="lower right", fontsize=8)

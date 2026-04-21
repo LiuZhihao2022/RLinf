@@ -46,7 +46,6 @@ from torch import Tensor
 
 from .configuration import BinaryValueConfig
 from .modeling_critic import BinaryValueCriticModel, CriticOutput
-from .modeling_rewind_arm import CLASS_PROGRESS, CLASS_REGRESS
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +63,14 @@ class EnsembleCriticOutput(CriticOutput):
     """
 
     member_predicted_values: Optional[torch.FloatTensor] = None
+    # Per-member softmax distribution and raw logits, shape [E, B, num_bins].
+    # Only populated on the inference path (predict / forward with
+    # labels is None). Consumers (rich visualization, advantage-pipeline
+    # entropy stats) rely on these; the single-model forward does not
+    # have an ensemble axis so :class:`CriticOutput` intentionally omits
+    # them.
+    member_probs: Optional[torch.FloatTensor] = None
+    member_logits: Optional[torch.FloatTensor] = None
     prediction_mean: Optional[torch.FloatTensor] = None
     prediction_min: Optional[torch.FloatTensor] = None
     prediction_variance: Optional[torch.FloatTensor] = None
@@ -83,13 +90,11 @@ def clone_ensemble_members(
 
 def _reinitialize_module_parameters(module: nn.Module, seed: int) -> None:
     """Reset all resettable submodules under ``module`` with a fixed seed."""
-    cuda_devices = sorted(
-        {
-            int(parameter.device.index)
-            for parameter in module.parameters()
-            if parameter.is_cuda and parameter.device.index is not None
-        }
-    )
+    cuda_devices = sorted({
+        int(parameter.device.index)
+        for parameter in module.parameters()
+        if parameter.is_cuda and parameter.device.index is not None
+    })
     with torch.random.fork_rng(devices=cuda_devices):
         torch.manual_seed(int(seed))
         for submodule in module.modules():
@@ -123,7 +128,40 @@ def build_ensemble_members(
 
 
 class EnsembleBinaryValueCriticModel(nn.Module):
-    """Deep-ensemble wrapper for :class:`BinaryValueCriticModel`."""
+    """Deep-ensemble wrapper for :class:`BinaryValueCriticModel`.
+
+    Supports both the legacy binary (num_bins == 2) and the multi-bin
+    (num_bins > 2) head shapes. The per-member call returns logits /
+    probs of shape ``[B, num_bins]`` in either mode, and the aggregator
+    below reduces across the ensemble axis according to
+    ``config.inference_mode``.
+
+    Aggregation contract. ``predicted_values`` carries the single-model
+    ``_predicted_signed_value`` output — a bin-weighted, ``half``-normalized
+    expectation in ``[-1, 1]`` (see
+    :meth:`BinaryValueCriticModel._predicted_signed_value`). The ensemble
+    preserves that scale across all three modes:
+
+        * ``mo``  — ``aggregated_probs`` is the per-bin member mean, and
+          ``aggregated`` is the signed-value of that mean distribution.
+          By linearity it equals ``prediction_mean``, so the equality
+          ``signed_value(aggregated_probs) == predicted_values`` holds
+          by construction.
+        * ``wco`` — gather the worst member's logits / probs per batch
+          item (worst = lowest signed value, i.e. most regressive). The
+          gathered distribution is a real single-member distribution and
+          its signed-value equals ``prediction_min``, so the equality
+          above still holds.
+        * ``uwo`` — apply the mean-minus-``λ``·variance penalty directly
+          in the ``[-1, 1]`` signed-value space (no logit/sigmoid
+          round-trip) and clamp to ``[-1, 1]``. ``aggregated_logits /
+          probs`` fall back to the member mean for reporting only — they
+          are **not** the distribution that produced ``aggregated`` in
+          UWO mode, so the equality above does **not** hold in UWO.
+          Downstream code in this repo consumes ``predicted_values``
+          (plus the ensemble stats), so the UWO-specific divergence is
+          safe.
+    """
 
     def __init__(
         self,
@@ -180,16 +218,6 @@ class EnsembleBinaryValueCriticModel(nn.Module):
             member.attach_runtime_assets(processor, input_transform, device)
 
     @staticmethod
-    def _binary_logits_from_progress_probability(progress_prob: Tensor) -> Tensor:
-        """Build a 2-logit representation from a binary progress probability."""
-        clamped_progress = progress_prob.float().clamp(min=1e-6, max=1.0 - 1e-6)
-        progress_margin = torch.logit(clamped_progress)
-        return torch.stack(
-            (-0.5 * progress_margin, 0.5 * progress_margin),
-            dim=-1,
-        ).to(dtype=progress_prob.dtype)
-
-    @staticmethod
     def _gather_member_batch_values(
         member_tensor: Tensor, member_indices: Tensor
     ) -> Tensor:
@@ -210,11 +238,17 @@ class EnsembleBinaryValueCriticModel(nn.Module):
         prediction_variance = member_predicted_values.var(dim=0, unbiased=False)
 
         if self.config.inference_mode == "mo":
-            aggregated_probs = member_probs.mean(dim=0)
-            aggregated = aggregated_probs[:, CLASS_PROGRESS]
-            aggregated_logits = self._binary_logits_from_progress_probability(
-                aggregated
-            )
+            aggregated_probs = member_probs.mean(dim=0)  # [B, num_bins]
+            # By linearity of expectation, the signed-value of the
+            # mean-of-probs equals the mean of member signed-values. Use
+            # the pre-computed ``prediction_mean`` so ``predicted_values``
+            # stays bit-identical with ``prediction_mean`` in mo mode.
+            aggregated = prediction_mean
+            # Reporting-only: the mean-of-logits does not recover
+            # ``aggregated`` via softmax, but the mean-of-probs does.
+            # Keep the member-logit mean so downstream code that
+            # inspects the logits sees a sensible per-bin signal.
+            aggregated_logits = member_logits.mean(dim=0)
         elif self.config.inference_mode == "wco":
             aggregated_logits = self._gather_member_batch_values(
                 member_logits,
@@ -224,20 +258,33 @@ class EnsembleBinaryValueCriticModel(nn.Module):
                 member_probs,
                 worst_member_indices,
             )
-            aggregated = aggregated_probs[:, CLASS_PROGRESS]
+            # Worst member = lowest signed value = most regressive. The
+            # gathered distribution's signed-value equals prediction_min
+            # by construction (worst_member_indices come from argmin on
+            # member_predicted_values), so reuse it directly.
+            aggregated = prediction_min
         elif self.config.inference_mode == "uwo":
-            member_margins = (
-                member_logits[..., CLASS_PROGRESS] - member_logits[..., CLASS_REGRESS]
+            # UWO in signed-value space: ``mean - λ · variance`` applied
+            # directly on the ``[-1, 1]`` score, with a final clamp to
+            # keep ``predicted_values`` in range. No logit/sigmoid
+            # round-trip — the signed score already encodes direction
+            # and strength, so penalizing disagreement on this scale is
+            # the native form. Note: ``uwo_lambda`` is now a coefficient
+            # on variance in ``[-1, 1]`` space rather than log-odds
+            # space, so its tuned magnitude will differ from the old
+            # logit-based formulation.
+            aggregated_margin = prediction_mean - (
+                self.config.uwo_lambda * prediction_variance
             )
-            aggregated_margin = member_margins.mean(dim=0) - (
-                self.config.uwo_lambda * member_margins.var(dim=0, unbiased=False)
+            aggregated = aggregated_margin.clamp(min=-1.0, max=1.0).to(
+                dtype=member_predicted_values.dtype
             )
-            aggregated_logits = torch.stack(
-                (-0.5 * aggregated_margin, 0.5 * aggregated_margin),
-                dim=-1,
-            )
-            aggregated_probs = torch.softmax(aggregated_logits, dim=-1)
-            aggregated = aggregated_probs[:, CLASS_PROGRESS]
+            # Reporting-only: member means do NOT match ``aggregated``
+            # under UWO. Documented on the class docstring; downstream
+            # consumers only read ``predicted_values`` plus the
+            # ensemble stats, so this divergence is safe here.
+            aggregated_probs = member_probs.mean(dim=0)
+            aggregated_logits = member_logits.mean(dim=0)
         else:
             raise ValueError(
                 f"Unsupported inference_mode: {self.config.inference_mode}"
@@ -325,6 +372,11 @@ class EnsembleBinaryValueCriticModel(nn.Module):
             atoms=None,
             hidden_states=None,
             member_predicted_values=member_predicted_values,
+            # member_{logits,probs} let downstream tools (rich viz,
+            # advantage parquet) compute per-member entropy / expected
+            # stride without re-running inference. Shape [E, B, num_bins].
+            member_probs=member_probs,
+            member_logits=member_logits,
             prediction_mean=prediction_mean,
             prediction_min=prediction_min,
             prediction_variance=prediction_variance,
@@ -440,15 +492,13 @@ class EnsembleBinaryValueCriticModel(nn.Module):
             value_variance = result.prediction_variance.cpu()
 
             for idx in range(len(batch_obs)):
-                all_outputs.append(
-                    {
-                        "value": float(values[idx].item()),
-                        "member_values": member_values[:, idx].tolist(),
-                        "value_mean": float(value_mean[idx].item()),
-                        "value_min": float(value_min[idx].item()),
-                        "value_variance": float(value_variance[idx].item()),
-                    }
-                )
+                all_outputs.append({
+                    "value": float(values[idx].item()),
+                    "member_values": member_values[:, idx].tolist(),
+                    "value_mean": float(value_mean[idx].item()),
+                    "value_min": float(value_min[idx].item()),
+                    "value_variance": float(value_variance[idx].item()),
+                })
 
         return all_outputs
 

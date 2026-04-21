@@ -18,12 +18,16 @@ from .pair_dataset import (
     BinaryPairDataCollator,
     PairDataset,
     TrajectorySource,
-    sample_time_counter_diagnosis_batch,
+    _signed_stride_to_bin,
+    bin_centers,
+    expected_signed_stride,
 )
 
 __all__ = [
     "BinaryPairDataCollator",
     "PairDataset",
     "TrajectorySource",
-    "sample_time_counter_diagnosis_batch",
+    "_signed_stride_to_bin",
+    "bin_centers",
+    "expected_signed_stride",
 ]

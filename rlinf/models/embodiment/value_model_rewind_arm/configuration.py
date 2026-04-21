@@ -92,11 +92,18 @@ class BinaryValueConfig(PretrainedConfig):
         language_repo_id: str = "",
         vision_revision: Optional[str] = None,
         language_revision: Optional[str] = None,
-        # Fusion + binary head
+        # Fusion + binary / multi-bin head
         fusion_hidden_dim: int = 512,
         dropout: float = 0.1,
         label_smoothing: float = 0.05,
         num_frames_per_pair: int = 2,
+        # num_bins == 2 → legacy binary mode (fixed k, labels are long
+        # bin indices in {0, 1}: 0 = regress, 1 = progress).
+        # num_bins  > 2 → multi-bin mode: pair_dataset samples i ∈ [1, K],
+        # signed stride in [-K, K] \ {0} is discretized into num_bins
+        # contiguous bins. Must be even so the sign split lands exactly at
+        # num_bins // 2.
+        num_bins: int = 2,
         ensemble_size: int = 1,
         inference_mode: str = "mo",
         uwo_lambda: float = 1.0,
@@ -124,6 +131,7 @@ class BinaryValueConfig(PretrainedConfig):
         self.dropout = dropout
         self.label_smoothing = label_smoothing
         self.num_frames_per_pair = num_frames_per_pair
+        self.num_bins = int(num_bins)
         self.ensemble_size = int(ensemble_size)
         self.inference_mode = normalize_binary_value_inference_mode(inference_mode)
         self.uwo_lambda = float(uwo_lambda)
@@ -165,6 +173,12 @@ class BinaryValueConfig(PretrainedConfig):
             )
         if self.num_frames_per_pair < 1:
             raise ValueError("num_frames_per_pair must be >= 1")
+        # num_bins must be even so the progressive / regressive split lands
+        # exactly at num_bins // 2. num_bins == 2 selects the legacy binary
+        # mode; num_bins > 2 activates multi-bin. An odd num_bins would leave
+        # a center bin straddling signed-stride == 0, which we don't sample.
+        if self.num_bins < 2 or self.num_bins % 2 != 0:
+            raise ValueError(f"num_bins must be >= 2 and even, got {self.num_bins}")
         if self.ensemble_size < 1:
             raise ValueError("ensemble_size must be >= 1")
         if self.uwo_lambda < 0.0:

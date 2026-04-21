@@ -49,6 +49,7 @@ _BINARY_VALUE_CONFIG_DEFAULTS: dict[str, Any] = {
     "dropout": 0.1,
     "label_smoothing": 0.05,
     "num_frames_per_pair": 2,
+    "num_bins": 2,
     "ensemble_size": 1,
     "inference_mode": "mo",
     "uwo_lambda": 1.0,

@@ -24,7 +24,7 @@ Dataset contract (``__getitem__``):
         "prompt": str,
         "state":    Optional[np.ndarray],  # proprio at t (for state-in-prompt)
         "state_tk": Optional[np.ndarray],  # proprio at t+k (reserved)
-        "label": float,                    # +1 = progress, -1 = regress
+        "label": int,                      # long bin index in [0, num_bins); binary: 0 = regress, 1 = progress
         "episode": int,
         "frame_idx_t": int,
         "frame_idx_tk": int,
@@ -126,6 +126,115 @@ def _to_float32_1d(state: Any, *, max_dim: Optional[int] = None) -> np.ndarray:
         padded[: arr.shape[0]] = arr
         return padded
     return arr
+
+
+# ---------------------------------------------------------------------------
+# Signed-stride → bin mapping (multi-bin mode)
+# ---------------------------------------------------------------------------
+
+
+def _signed_stride_to_bin(stride: int, K: int, num_bins: int) -> int:
+    """Map a signed stride in ``{-K,...,-1,1,...,K}`` to a bin index.
+
+    Layout:
+        * ``pos = stride + K``         if stride < 0  (pos ∈ [0, K))
+        * ``pos = stride + K - 1``     if stride > 0  (pos ∈ [K, 2K))
+        * ``bin_idx = (pos * num_bins) // (2 * K)``   in [0, num_bins)
+
+    With ``num_bins`` even and ``2K % num_bins == 0`` (enforced at
+    :class:`PairDataset` construction), the sign split lands exactly at
+    ``num_bins // 2``: bins ``[0, num_bins // 2)`` are regressive and
+    bins ``[num_bins // 2, num_bins)`` are progressive.
+
+    Raises:
+        ValueError: if ``stride == 0`` (sampling excludes zero strides)
+            or if ``abs(stride) > K``.
+    """
+    if stride == 0:
+        raise ValueError(
+            "_signed_stride_to_bin does not accept stride == 0; the multi-bin "
+            "sampling path skips i == 0."
+        )
+    if abs(stride) > K:
+        raise ValueError(
+            f"_signed_stride_to_bin requires |stride| <= K, got stride={stride}, K={K}."
+        )
+    pos = stride + K if stride < 0 else stride + K - 1
+    return int((pos * num_bins) // (2 * K))
+
+
+def bin_centers(K: int, num_bins: int) -> np.ndarray:
+    """Return the ``[num_bins]`` signed-stride centers for the bin layout.
+
+    Each bin owns a contiguous set of ``strides_per_bin = 2K / num_bins``
+    signed strides; the center is their arithmetic mean. By construction
+    :func:`_signed_stride_to_bin` maps every stride into the bin whose
+    center is closest (for even ``strides_per_bin`` the boundary ties
+    are absorbed by the half-integer offsets).
+
+    Examples:
+        * ``K=8, num_bins=8``  → ``[-7.5, -5.5, -3.5, -1.5, 1.5, 3.5, 5.5, 7.5]``
+        * ``K=4, num_bins=4``  → ``[-3.5, -1.5, 1.5, 3.5]``
+        * ``K=K, num_bins=2``  → ``[-K/2, K/2]`` — binary degenerate:
+          :math:`E[s] / K = 2 \\cdot p_\\text{progress} - 1`, matching
+          the existing ``2·P − 1`` signed-confidence derivation.
+
+    Raises:
+        ValueError: ``num_bins`` not even or ``2K % num_bins != 0``.
+    """
+    if num_bins < 2 or num_bins % 2 != 0:
+        raise ValueError(f"num_bins must be >= 2 and even, got {num_bins}")
+    if (2 * K) % num_bins != 0:
+        raise ValueError(
+            f"bin_centers requires 2*K to be a multiple of num_bins; "
+            f"got K={K}, num_bins={num_bins} (2K={2 * K})."
+        )
+    strides_per_bin = (2 * K) // num_bins
+    half = num_bins // 2
+    # Regressive bins: cover signed strides [-K, -1] in order.
+    # Progressive bins: cover signed strides [1, K] in order.
+    # Center of a regressive bin b ∈ [0, half): midpoint of its
+    # strides_per_bin consecutive strides starting at -K + b * strides_per_bin.
+    # Center of a progressive bin b ∈ [half, num_bins): midpoint starting
+    # at 1 + (b - half) * strides_per_bin.
+    centers = np.empty(num_bins, dtype=np.float32)
+    for b in range(num_bins):
+        if b < half:
+            low = -K + b * strides_per_bin
+        else:
+            low = 1 + (b - half) * strides_per_bin
+        high = low + strides_per_bin - 1
+        centers[b] = (low + high) / 2.0
+    return centers
+
+
+def expected_signed_stride(probs, K: int, num_bins: int):
+    """Return ``E[s] = Σ_b probs[..., b] * bin_centers[b]``.
+
+    Backend-polymorphic: if ``probs`` is a :class:`torch.Tensor` the
+    computation stays on the input's device / dtype; otherwise falls
+    back to numpy. The last dim of ``probs`` must equal ``num_bins``.
+
+    For the binary degenerate case ``num_bins == 2``, equals
+    ``K * (probs[..., 1] - probs[..., 0]) = K * (2·p_progress - 1)``.
+    Dividing by ``K`` gives a ``[-1, 1]``-range signed confidence score
+    consistent with the cumulative-progress integrator used in the
+    visualize script.
+    """
+    centers_np = bin_centers(K, num_bins)
+    if isinstance(probs, torch.Tensor):
+        if probs.shape[-1] != num_bins:
+            raise ValueError(
+                f"probs last dim must be num_bins={num_bins}, got {tuple(probs.shape)}"
+            )
+        centers_t = torch.as_tensor(centers_np, dtype=probs.dtype, device=probs.device)
+        return (probs * centers_t).sum(dim=-1)
+    probs_np = np.asarray(probs)
+    if probs_np.shape[-1] != num_bins:
+        raise ValueError(
+            f"probs last dim must be num_bins={num_bins}, got {probs_np.shape}"
+        )
+    return (probs_np * centers_np).sum(axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +507,7 @@ class PairDataset(Dataset):
         dataset_type: Optional[str] = None,
         only_success: Optional[bool] = None,
         min_episode_length: Optional[int] = None,
+        num_bins: int = 2,
     ) -> None:
         self.camera_keys: tuple[str, ...] = tuple(camera_keys)
         if not self.camera_keys:
@@ -405,6 +515,22 @@ class PairDataset(Dataset):
         self.k = int(k)
         if self.k < 1:
             raise ValueError(f"k must be >= 1, got {self.k}")
+        # Mode switch. num_bins == 2 → legacy binary mode: fixed-stride k.
+        # num_bins > 2 → multi-bin: sample i uniformly from [1, min(K, T-1-t)]
+        # per-anchor at __getitem__ time. Both emit a long bin-index label
+        # in [0, num_bins); the bin layout (_signed_stride_to_bin) places
+        # regressive bins in [0, num_bins // 2) and progressive bins in
+        # [num_bins // 2, num_bins), so binary degenerates to 0 = regress,
+        # 1 = progress. 2K must be an integer multiple of num_bins so every
+        # bin covers the same number of strides (uniform bin widths).
+        self.num_bins = int(num_bins)
+        if self.num_bins < 2 or self.num_bins % 2 != 0:
+            raise ValueError(f"num_bins must be >= 2 and even, got {self.num_bins}")
+        if self.num_bins > 2 and (2 * self.k) % self.num_bins != 0:
+            raise ValueError(
+                f"For num_bins={self.num_bins} in multi-bin mode, 2*k must be a "
+                f"multiple of num_bins; got k={self.k} (2*k={2 * self.k})."
+            )
         self.include_state = bool(include_state)
         self.state_max_dim = state_max_dim
         self.state_key = state_key
@@ -475,20 +601,20 @@ class PairDataset(Dataset):
 
         logger.info(
             "PairDataset: dataset_path=%s, episodes=%d eligible=%d, k=%d, "
-            "total_positions=%d, include_state=%s, dataset_type=%s, "
-            "only_success=%s, camera_keys=%s",
+            "num_bins=%d (%s mode), total_positions=%d, include_state=%s, "
+            "dataset_type=%s, only_success=%s, camera_keys=%s",
             self.source_name,
             total_eps,
             len(self._eligible),
             self.k,
+            self.num_bins,
+            "binary" if self.num_bins == 2 else "multi-bin",
             self._num_pair_positions,
             self.include_state,
             self.dataset_type,
             self.only_success,
             self.camera_keys,
         )
-
-    # --- Public accessors (used by the time-counter diagnostic) ---
 
     @property
     def source(self) -> TrajectorySource:
@@ -549,9 +675,16 @@ class PairDataset(Dataset):
         frame_idx_t: int,
         frame_idx_tk: int,
         prompt: str,
-        label: float,
+        label,
     ) -> dict[str, Any]:
-        """Assemble the sample dict for a single labeled frame pair."""
+        """Assemble the sample dict for a single labeled frame pair.
+
+        ``label`` is a Python ``int`` bin index in ``[0, num_bins)``. The
+        collator casts the batched column to ``torch.long``. Binary mode
+        (``num_bins == 2``) degenerates to ``0 = regress``, ``1 =
+        progress``, matching the multi-bin layout from
+        :func:`_signed_stride_to_bin`.
+        """
         views_t, mask_t = self._load_views(episode, frame_idx_t)
         views_tk, mask_tk = self._load_views(episode, frame_idx_tk)
 
@@ -561,7 +694,7 @@ class PairDataset(Dataset):
             "image_mask_t": mask_t,
             "image_mask_tk": mask_tk,
             "prompt": prompt,
-            "label": float(label),
+            "label": label,
             "episode": int(episode),
             "frame_idx_t": int(frame_idx_t),
             "frame_idx_tk": int(frame_idx_tk),
@@ -598,17 +731,48 @@ class PairDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         pair_position, is_positive = self._decode_sample_index(idx)
-        episode, t, t_plus_k = self._resolve_pair_position(pair_position)
+        episode, t, t_plus_k_binary = self._resolve_pair_position(pair_position)
         prompt = self._resolve_prompt(episode, t)
-        # Positive: (t, t+k). Negative: swap the two slots so the "later"
-        # frame in original time occupies image_t — the model sees what
-        # looks like a forward pair but the motion is reversed.
-        if is_positive:
-            frame_idx_t, frame_idx_tk = t, t_plus_k
-            label = 1.0
+
+        if self.num_bins == 2:
+            # Binary path: fixed stride k with the existing boundary
+            # clamp (t+k may degrade to T-1 near episode end). Labels are
+            # long bin indices matching the multi-bin layout — 1 for
+            # progress (positive stride), 0 for regress (negative stride).
+            if is_positive:
+                frame_idx_t, frame_idx_tk = t, t_plus_k_binary
+                label: Any = 1
+            else:
+                frame_idx_t, frame_idx_tk = t_plus_k_binary, t
+                label = 0
         else:
-            frame_idx_t, frame_idx_tk = t_plus_k, t
-            label = -1.0
+            # Multi-bin path: sample i uniformly from [1, min(K, T-1-t)]
+            # at getitem time so every anchor gets exposure to every
+            # valid stride over enough epochs. No boundary clamp — the
+            # emitted bin always matches the true stride.
+            episode_length = self._source.episode_length(episode)
+            max_valid_stride = min(self.k, episode_length - 1 - t)
+            if max_valid_stride < 1:
+                # Should not happen: _pair_position_ends enumerates only
+                # t ≤ T-2, so episode_length - 1 - t ≥ 1. Fail-loud per
+                # 78bc04dd rather than silently handle.
+                raise RuntimeError(
+                    f"PairDataset: no valid stride for episode={episode} "
+                    f"t={t} episode_length={episode_length} (bug in anchor "
+                    "enumeration)."
+                )
+            # Fresh RNG per call — OS-entropy seeded, so DataLoader
+            # workers do not correlate on a shared numpy seed without
+            # needing a worker_init_fn.
+            rng = np.random.default_rng()
+            i = int(rng.integers(low=1, high=max_valid_stride + 1))
+            if is_positive:
+                frame_idx_t, frame_idx_tk = t, t + i
+                signed_stride = i
+            else:
+                frame_idx_t, frame_idx_tk = t + i, t
+                signed_stride = -i
+            label = _signed_stride_to_bin(signed_stride, self.k, self.num_bins)
 
         return self._build_sample(
             episode=episode,
@@ -640,11 +804,17 @@ ValueDataCollator`. Runs the evorl :class:`Pistar06ValueProcessor` **twice**
             matching the dataset's ``camera_keys``.
         max_length: Token padding length.
         train: If ``True``, the processor's image augmentations fire.
+        num_bins: Matches the paired :class:`PairDataset`'s ``num_bins``.
+            Used only for validation assertions — labels are always
+            emitted as ``torch.long`` bin indices in ``[0, num_bins)``,
+            so binary (``num_bins == 2``) and multi-bin (``num_bins >
+            2``) share the same tensor dtype.
     """
 
     processor: Any
     max_length: int = 200
     train: bool = True
+    num_bins: int = 2
 
     def _collect_per_camera(
         self,
@@ -796,16 +966,14 @@ ValueDataCollator`. Runs the evorl :class:`Pistar06ValueProcessor` **twice**
         if any_state:
             template = next((s for s in states_list if s is not None), None)
             state_dim = int(template.shape[0])
-            state_batch = np.stack(
-                [
-                    (
-                        np.asarray(s, dtype=np.float32).reshape(-1)
-                        if s is not None
-                        else np.zeros(state_dim, dtype=np.float32)
-                    )
-                    for s in states_list
-                ]
-            )
+            state_batch = np.stack([
+                (
+                    np.asarray(s, dtype=np.float32).reshape(-1)
+                    if s is not None
+                    else np.zeros(state_dim, dtype=np.float32)
+                )
+                for s in states_list
+            ])
 
         processed_txt = self.processor.process_text(
             prompts=prompts,
@@ -821,8 +989,12 @@ ValueDataCollator`. Runs the evorl :class:`Pistar06ValueProcessor` **twice**
             "tokenized_prompt_mask": processed_txt["attention_mask"].bool(),
         }
 
+        # Labels are always long bin indices in [0, num_bins). Binary
+        # (num_bins == 2) uses 0 = regress, 1 = progress; multi-bin uses
+        # the _signed_stride_to_bin layout. Both feed straight into
+        # ``F.cross_entropy`` with no further remapping.
         labels = torch.tensor(
-            [float(ex["label"]) for ex in examples], dtype=torch.float32
+            [int(ex["label"]) for ex in examples], dtype=torch.long
         )
         return {
             "observation": observation,
@@ -839,128 +1011,8 @@ ValueDataCollator`. Runs the evorl :class:`Pistar06ValueProcessor` **twice**
         }
 
 
-# ---------------------------------------------------------------------------
-# Time-counter-shortcut diagnostic
-# ---------------------------------------------------------------------------
-
-
-def sample_time_counter_diagnosis_batch(
-    dataset: "PairDataset",
-    num_samples: int,
-    *,
-    num_anchors: Optional[int] = None,
-    seed: int = 0,
-) -> dict[str, list[dict[str, Any]]]:
-    """Build the (normal, shuffled) sample lists for the time-counter test.
-
-    Both lists follow the same schema as :meth:`PairDataset.__getitem__`.
-    For each anchor ``(episode_A, t, t+k)``:
-
-        * ``normal``:   frame_A[t], frame_A[t+k]           (label +1)
-        * ``shuffled``: frame_A[t], frame_B[t+k]           (label +1 — ignored)
-
-    ``episode_B`` is a different eligible episode that covers ``t+k``.
-    """
-    if num_samples <= 0:
-        raise ValueError(f"num_samples must be > 0, got {num_samples}")
-    k = dataset.k
-    source = dataset.source
-    eligible = dataset.eligible_episodes
-    if len(eligible) < 2:
-        raise ValueError(
-            "Need at least 2 eligible episodes to construct a shuffled pair"
-        )
-
-    rng = np.random.default_rng(seed)
-    anchors: list[tuple[int, int]] = []
-    max_anchors = num_samples if num_anchors is None else int(num_anchors)
-    while len(anchors) < max_anchors:
-        ep_a = int(eligible[rng.integers(low=0, high=len(eligible))])
-        length_a = source.episode_length(ep_a)
-        if length_a <= k:
-            continue
-        t = int(rng.integers(low=0, high=length_a - k))
-        anchors.append((ep_a, t))
-
-    def _collect_views(episode: int, frame_idx: int) -> tuple[dict, dict]:
-        views: dict[str, np.ndarray] = {}
-        masks: dict[str, bool] = {}
-        for cam in dataset.camera_keys:
-            v = source.get_view(episode, frame_idx, cam)
-            if v is None:
-                masks[cam] = False
-            else:
-                views[cam] = v
-                masks[cam] = True
-        return views, masks
-
-    normal: list[dict[str, Any]] = []
-    shuffled: list[dict[str, Any]] = []
-
-    for i in range(num_samples):
-        ep_a, t = anchors[i % len(anchors)]
-        for _ in range(64):
-            ep_b = int(eligible[rng.integers(low=0, high=len(eligible))])
-            if ep_b != ep_a and source.episode_length(ep_b) > t + k:
-                break
-        else:
-            continue
-
-        views_a_t, mask_a_t = _collect_views(ep_a, t)
-        views_a_tk, mask_a_tk = _collect_views(ep_a, t + k)
-        views_b_tk, mask_b_tk = _collect_views(ep_b, t + k)
-
-        prompt_a = source.get_prompt(ep_a, t)
-        base = {
-            "prompt": prompt_a,
-            "label": 1.0,
-            "episode": ep_a,
-            "frame_idx_t": t,
-            "frame_idx_tk": t + k,
-        }
-        normal.append(
-            {
-                **base,
-                "image_t": views_a_t,
-                "image_mask_t": mask_a_t,
-                "image_tk": views_a_tk,
-                "image_mask_tk": mask_a_tk,
-            }
-        )
-        shuffled.append(
-            {
-                **base,
-                "image_t": views_a_t,
-                "image_mask_t": mask_a_t,
-                "image_tk": views_b_tk,
-                "image_mask_tk": mask_b_tk,
-            }
-        )
-
-        if dataset.include_state:
-            sa_t = _to_float32_1d(
-                source.get_state(ep_a, t, dataset.state_key),
-                max_dim=dataset.state_max_dim,
-            )
-            sa_tk = _to_float32_1d(
-                source.get_state(ep_a, t + k, dataset.state_key),
-                max_dim=dataset.state_max_dim,
-            )
-            sb_tk = _to_float32_1d(
-                source.get_state(ep_b, t + k, dataset.state_key),
-                max_dim=dataset.state_max_dim,
-            )
-            normal[-1]["state"] = sa_t
-            normal[-1]["state_tk"] = sa_tk
-            shuffled[-1]["state"] = sa_t
-            shuffled[-1]["state_tk"] = sb_tk
-
-    return {"normal": normal, "shuffled": shuffled}
-
-
 __all__ = [
     "BinaryPairDataCollator",
     "PairDataset",
     "TrajectorySource",
-    "sample_time_counter_diagnosis_batch",
 ]

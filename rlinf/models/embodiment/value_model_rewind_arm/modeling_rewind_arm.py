@@ -206,8 +206,7 @@ def _load_language_model(
     model_config = AutoConfig.from_pretrained(repo_id, revision=revision)
     architectures = getattr(model_config, "architectures", None) or []
     prefer_causal_lm = any(
-        isinstance(arch, str) and arch.endswith("ForCausalLM")
-        for arch in architectures
+        isinstance(arch, str) and arch.endswith("ForCausalLM") for arch in architectures
     )
     if prefer_causal_lm:
         lm_with_head = AutoModelForCausalLM.from_pretrained(
@@ -304,13 +303,16 @@ class RewindArmBackbone(nn.Module):
 
         fused_dim = cfg.fusion_hidden_dim * (cfg.num_frames_per_pair + 1)
         self.fusion_norm = nn.LayerNorm(fused_dim)
+        # Head width is num_bins: 2 for the legacy binary mode (output is
+        # [regress_logit, progress_logit]) or num_bins > 2 for multi-bin
+        # classification over signed-stride bins. The critic applies softmax
+        # and cross-entropy with label smoothing on top in either case.
+        head_out_dim = int(getattr(cfg, "num_bins", NUM_CLASSES))
         self.value_head = nn.Sequential(
             nn.Linear(fused_dim, cfg.fusion_hidden_dim),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            # Output is [regress_logit, progress_logit]; the critic applies
-            # softmax and cross-entropy with label smoothing on top.
-            nn.Linear(cfg.fusion_hidden_dim, NUM_CLASSES),
+            nn.Linear(cfg.fusion_hidden_dim, head_out_dim),
         )
 
         if cfg.use_gradient_checkpointing:
@@ -385,9 +387,7 @@ class RewindArmBackbone(nn.Module):
         )
         hidden = getattr(outputs, "last_hidden_state", None)
         if hidden is None:
-            raise ValueError(
-                "Language model output does not contain last_hidden_state"
-            )
+            raise ValueError("Language model output does not contain last_hidden_state")
         mask = attention_mask.to(dtype=hidden.dtype).unsqueeze(-1)
         denom = mask.sum(dim=1).clamp_min(1.0)
         return (hidden * mask).sum(dim=1) / denom
@@ -454,9 +454,7 @@ class RewindArmBackbone(nn.Module):
 
         language_mask = attention_mask.to(dtype=torch.bool, device=input_ids.device)
         if not torch.all(language_mask.any(dim=1)):
-            raise ValueError(
-                "Each sample must have at least one valid language token"
-            )
+            raise ValueError("Each sample must have at least one valid language token")
 
         # Flatten (batch, camera, frame) to run the vision encoder once per
         # (sample, camera, frame) triple.
@@ -466,15 +464,11 @@ class RewindArmBackbone(nn.Module):
             dtype=self.model_dtype
         )
 
-        image_ctx = (
-            torch.no_grad() if self.cfg.freeze_vision_encoder else nullcontext()
-        )
+        image_ctx = torch.no_grad() if self.cfg.freeze_vision_encoder else nullcontext()
         with image_ctx:
             vision_feats = self._encode_vision(flat_images)
 
-        lang_ctx = (
-            torch.no_grad() if self.cfg.freeze_language_model else nullcontext()
-        )
+        lang_ctx = torch.no_grad() if self.cfg.freeze_language_model else nullcontext()
         with lang_ctx:
             lang_feat_raw = self._encode_prompt(
                 input_ids=input_ids, attention_mask=language_mask.long()
@@ -504,9 +498,7 @@ class RewindArmBackbone(nn.Module):
             self.language_projector,
             lang_feat_raw.dtype,
         )
-        lang = self.language_projector(
-            lang_feat_raw.to(dtype=language_projector_dtype)
-        )
+        lang = self.language_projector(lang_feat_raw.to(dtype=language_projector_dtype))
         return self._fuse(per_frame_features, lang)
 
     def _check_shapes(
@@ -529,7 +521,10 @@ class RewindArmBackbone(nn.Module):
                 "'images' must have shape [B, num_cameras, num_frames, C, H, W], "
                 f"got {tuple(images.shape)}"
             )
-        if image_attention_mask.ndim != 3 or image_attention_mask.shape[:3] != images.shape[:3]:
+        if (
+            image_attention_mask.ndim != 3
+            or image_attention_mask.shape[:3] != images.shape[:3]
+        ):
             raise ValueError(
                 "Batch/camera/frame mismatch between images and image_attention_mask"
             )

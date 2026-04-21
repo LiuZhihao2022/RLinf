@@ -22,10 +22,15 @@ offline advantage pipeline can dispatch on ``model_type`` alone.
 
 The only real differences from the evorl variant:
     * ``forward(observation, labels)`` replaces ``(observation, target_values)``
-      — labels are in ``{-1, +1}``.
-    * :meth:`_compute_binary_loss` replaces ``_compute_categorical_loss``.
-    * ``CriticOutput.predicted_values`` holds the sigmoid probability instead
-      of the expected value over bins, and ``CriticOutput.atoms`` is ``None``.
+      — labels are long bin indices in ``[0, num_bins)`` (binary degenerates
+      to ``0 = regress, 1 = progress``).
+    * :meth:`_compute_loss` replaces ``_compute_categorical_loss`` with a
+      ``num_bins``-way cross-entropy that covers both binary and multi-bin.
+    * ``CriticOutput.predicted_values`` holds a signed, bin-weighted
+      expectation in ``[-1, 1]`` — ``Σ_b p_b · signed_bin_b / half`` where
+      ``signed_bin ∈ {-half, …, -1, 1, …, half}`` and ``half = num_bins //
+      2`` — instead of a scalar expected value over value bins.
+      ``CriticOutput.atoms`` is ``None``.
 
 Public API (mirrors value_model.modeling_critic.ValueCriticModel):
     - forward(observation, labels=None) -> CriticOutput
@@ -52,8 +57,6 @@ from transformers.modeling_outputs import ModelOutput
 
 from .configuration import BinaryValueConfig
 from .modeling_rewind_arm import (
-    CLASS_PROGRESS,
-    NUM_CLASSES,
     RewindArmBackbone,
     _module_parameter_dtype,
 )
@@ -82,7 +85,10 @@ def _resolve_tokenizer_source(
     if explicit_tokenizer_path:
         return explicit_tokenizer_path, os.path.exists(explicit_tokenizer_path)
 
-    if any(os.path.exists(os.path.join(str(checkpoint_dir), name)) for name in tokenizer_files):
+    if any(
+        os.path.exists(os.path.join(str(checkpoint_dir), name))
+        for name in tokenizer_files
+    ):
         return str(checkpoint_dir), True
 
     model_tokenizer_source = getattr(model_config, "language_repo_id", None)
@@ -104,9 +110,12 @@ class CriticOutput(ModelOutput):
 modeling_critic.CriticOutput` so worker code stays duck-type-compatible.
     For the binary variant:
 
-        * ``logits`` is ``[B, 2]`` (``[regress_logit, progress_logit]``).
-        * ``probs`` is ``softmax(logits)`` — shape ``[B, 2]``.
-        * ``predicted_values`` is ``P(progress)`` — shape ``[B]``.
+        * ``logits`` is ``[B, num_bins]``.
+        * ``probs`` is ``softmax(logits)`` — shape ``[B, num_bins]``.
+        * ``predicted_values`` is a signed bin-weighted expectation in
+          ``[-1, 1]`` — shape ``[B]`` (see
+          :meth:`BinaryValueCriticModel._predicted_signed_value`). For
+          ``num_bins == 2`` this degenerates to ``2 · P(progress) - 1``.
         * ``atoms`` is always ``None``.
         * ``cat_acc_best`` carries binary accuracy for parity with evorl
           logging (the other cat_* fields stay ``None``).
@@ -270,33 +279,47 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
         )
 
     # ------------------------------------------------------------------
-    # Binary loss helper (replaces the evorl categorical loss)
+    # Loss — ``num_bins``-way cross-entropy (covers binary and multi-bin)
     # ------------------------------------------------------------------
 
-    def _compute_binary_loss(self, logits, labels):
-        """2-way cross-entropy with optional label smoothing.
+    def _compute_loss(self, logits, bin_labels):
+        """``num_bins``-way cross-entropy on bin indices.
 
-        Mirrors the evorl ``_compute_categorical_loss`` return shape so the
-        rest of the critic (forward, predict, CriticOutput) slots in
-        unchanged.
+        Paired with :class:`~rlinf.data.datasets.cfg.rewind.PairDataset`,
+        which emits long bin indices in ``[0, num_bins)`` for both the
+        binary (``num_bins == 2``) and multi-bin (``num_bins > 2``)
+        modes. The signed-stride → bin mapping is owned by the dataset's
+        ``_signed_stride_to_bin`` helper.
 
         Args:
-            logits: Shape ``[B, 2]`` — ``[regress_logit, progress_logit]``.
-            labels: Shape ``[B]`` with values in ``{-1, +1}``. ``-1`` → regress,
-                ``+1`` → progress.
+            logits: Shape ``[B, num_bins]``.
+            bin_labels: Shape ``[B]`` with values in ``[0, num_bins)``.
 
         Returns:
-            Tuple of (per-sample loss of shape ``[B]``, metrics dict).
-            Metric keys match the evorl slot names so
-            ``CriticOutput.cat_acc_best`` can carry classification accuracy;
-            the other cat_* fields are placeholders.
+            Tuple of (per-sample loss, metrics dict). Metrics:
+                * ``acc_best`` — exact-bin classification accuracy.
+                * ``acc_neighbor`` — ``|pred_bin - target_bin| ≤ 1``.
+                  Trivially 1 when ``num_bins == 2`` (no non-neighbor
+                  bins exist); kept for ``CriticOutput`` slot parity.
+                * ``mae`` — zero (no scalar target in this mode; kept
+                  for ``CriticOutput`` slot parity with the evorl
+                  categorical variant).
         """
-        if logits.ndim != 2 or logits.shape[-1] != NUM_CLASSES:
+        num_bins = int(self.config.num_bins)
+        if logits.ndim != 2 or logits.shape[-1] != num_bins:
             raise ValueError(
-                f"logits must have shape [B, {NUM_CLASSES}], got {tuple(logits.shape)}"
+                f"logits must have shape [B, {num_bins}], got {tuple(logits.shape)}"
             )
-        # {-1, +1} → {0, 1} int64 class indices.
-        targets = ((labels.to(dtype=torch.float32) + 1.0) / 2.0).long()
+        targets = bin_labels.to(dtype=torch.long)
+        if targets.ndim != 1:
+            raise ValueError(
+                f"bin_labels must be rank-1, got {tuple(bin_labels.shape)}"
+            )
+        if int(targets.min().item()) < 0 or int(targets.max().item()) >= num_bins:
+            raise ValueError(
+                f"bin_labels out of range [0, {num_bins}); "
+                f"min={int(targets.min().item())}, max={int(targets.max().item())}"
+            )
         loss = F.cross_entropy(
             logits,
             targets,
@@ -306,13 +329,55 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
 
         pred_class = logits.argmax(dim=-1)
         acc_best = (pred_class == targets).to(dtype=torch.float32).mean()
+        acc_neighbor = (
+            ((pred_class - targets).abs() <= 1).to(dtype=torch.float32).mean()
+        )
 
         metrics = {
             "acc_best": acc_best,
-            "acc_neighbor": torch.zeros((), device=logits.device),
+            "acc_neighbor": acc_neighbor,
             "mae": torch.zeros((), device=logits.device),
         }
         return loss, metrics
+
+    def _predicted_signed_value(self, probs: Tensor) -> Tensor:
+        """Return a signed bin-weighted expectation in ``[-1, 1]`` (shape ``[B]``).
+
+        Computes ``E[signed_bin] / half`` where ``half = num_bins // 2``
+        and each bin gets an integer signed position:
+
+            * bins ``[0, half)``            → signed values ``[-half, -1]``
+              (regressive, matching the negative-stride half of
+              ``pair_dataset._signed_stride_to_bin``).
+            * bins ``[half, num_bins)``     → signed values ``[1, half]``
+              (progressive).
+
+        Dividing by ``half`` maps the raw expectation (range
+        ``[-half, half]``) onto ``[-1, 1]``. Unlike the older
+        ``probs[:, half:num_bins].sum(-1)`` reading, this uses the full
+        distribution — a bin at the extreme (strong progress / strong
+        regress) contributes with larger magnitude than a near-midpoint
+        bin, so the score carries both direction and strength.
+
+        Binary (``num_bins == 2``) degenerates to
+        ``-p[:, 0] + p[:, 1] = 2 · P(progress) - 1``, matching the
+        signed-confidence convention documented on
+        :func:`~rlinf.data.datasets.cfg.rewind.pair_dataset.bin_centers`.
+        """
+        num_bins = int(self.config.num_bins)
+        half = num_bins // 2
+        if half < 1:
+            raise ValueError(
+                f"_predicted_signed_value requires num_bins >= 2 and even; "
+                f"got num_bins={num_bins}."
+            )
+        arange = torch.arange(num_bins, device=probs.device, dtype=probs.dtype)
+        signed_bin = torch.where(
+            arange < half,
+            arange - float(half),        # [0, half) -> [-half, -1]
+            arange - float(half) + 1.0,  # [half, num_bins) -> [1, half]
+        )
+        return (probs * signed_bin).sum(dim=-1) / float(half)
 
     # ------------------------------------------------------------------
     # Forward / predict
@@ -321,9 +386,10 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
     def forward(self, observation, labels=None, **kwargs) -> CriticOutput:
         """Forward pass — parallel to Pistar06ValueCriticModel.forward.
 
-        Stacks the observation, runs the multimodal backbone, squeezes the
-        single-logit head, and — if ``labels`` are provided — computes BCE +
-        accuracy via :meth:`_compute_binary_loss`. Returns a fully populated
+        Stacks the observation, runs the multimodal backbone, takes
+        softmax over the ``num_bins``-wide head, and — if ``labels`` are
+        provided — computes cross-entropy + accuracy via
+        :meth:`_compute_loss`. Returns a fully populated
         :class:`CriticOutput`.
         """
         input_ids, attention_mask, images, image_mask = self._stack_observation(
@@ -345,15 +411,15 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
         )
         logits = self.model.value_head(
             hidden_states.to(dtype=value_head_dtype)
-        )  # [B, 2]
+        )  # [B, num_bins]
 
-        probs = F.softmax(logits, dim=-1)  # [B, 2] — [p_regress, p_progress]
-        predicted_values = probs[:, CLASS_PROGRESS]  # [B] — P(progress)
+        probs = F.softmax(logits, dim=-1)  # [B, num_bins]
+        predicted_values = self._predicted_signed_value(probs)  # [B]
 
         expert_loss = None
         cat_metrics = None
         if labels is not None:
-            expert_loss, cat_metrics = self._compute_binary_loss(logits, labels)
+            expert_loss, cat_metrics = self._compute_loss(logits, labels)
 
         expert_loss_mean = expert_loss.mean() if expert_loss is not None else None
 
@@ -393,10 +459,12 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
             self.model.value_head,
             hidden_states.dtype,
         )
-        logits = self.model.value_head(hidden_states.to(dtype=value_head_dtype))  # [B, 2]
-        probs = F.softmax(logits, dim=-1)  # [B, 2]
+        logits = self.model.value_head(
+            hidden_states.to(dtype=value_head_dtype)
+        )  # [B, num_bins]
+        probs = F.softmax(logits, dim=-1)  # [B, num_bins]
 
-        predicted_values = probs[:, CLASS_PROGRESS]
+        predicted_values = self._predicted_signed_value(probs)
         return CriticOutput(
             predicted_values=predicted_values,
             logits=logits,
@@ -422,6 +490,7 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
         norm_stats: Optional[dict] = None,
         label_smoothing: Optional[float] = None,
         num_frames_per_pair: Optional[int] = None,
+        num_bins: Optional[int] = None,
         ensemble_size: Optional[int] = None,
         inference_mode: Optional[str] = None,
         precision: Optional[str] = None,
@@ -474,6 +543,7 @@ ensemble_modeling_critic.EnsembleBinaryValueCriticModel` wrapper when
             "language_repo_id": language_repo_id,
             "label_smoothing": label_smoothing,
             "num_frames_per_pair": num_frames_per_pair,
+            "num_bins": num_bins,
             "ensemble_size": ensemble_size,
             "inference_mode": inference_mode,
             "precision": precision,
@@ -525,7 +595,9 @@ ensemble_modeling_critic.EnsembleBinaryValueCriticModel` wrapper when
             )
             logger.info("  Found image processor config in checkpoint")
         except (OSError, ValueError):
-            logger.info("  No image processor config found in checkpoint; using defaults")
+            logger.info(
+                "  No image processor config found in checkpoint; using defaults"
+            )
 
         # Read state-in-prompt fields off the just-constructed model.config so
         # inference-time prompt construction matches what the model was trained

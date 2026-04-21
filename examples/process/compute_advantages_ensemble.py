@@ -141,13 +141,21 @@ from rlinf.data.datasets.cfg.rewind.pair_dataset import (  # noqa: E402
     BinaryPairDataCollator,
     _LeRobotSource,
     _to_float32_1d,
-)
-from rlinf.models.embodiment.value_model_rewind_arm.modeling_critic import (  # noqa: E402
-    BinaryValueCriticModel,
+    expected_signed_stride,
 )
 from rlinf.models.embodiment.value_model_rewind_arm.ensemble_modeling_critic import (  # noqa: E402
     EnsembleBinaryValueCriticModel,
 )
+from rlinf.models.embodiment.value_model_rewind_arm.modeling_critic import (  # noqa: E402
+    BinaryValueCriticModel,
+)
+
+
+def _entropy_nats(probs: np.ndarray) -> np.ndarray:
+    """Per-sample entropy in nats; shape ``[..., num_bins]`` -> ``[...]``."""
+    p = np.clip(np.asarray(probs, dtype=np.float64), 1e-12, 1.0)
+    return -np.sum(p * np.log(p), axis=-1)
+
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +236,7 @@ class BinaryPairInferenceDataset(Dataset):
         * No success-only filter — every episode contributes pairs (matches
           ``compute_advantages.py`` which scores every frame).
         * Forward direction only: ``image_t = frame_t``, ``image_tk = frame_{t+k}``,
-          ``label = 0.0`` (placeholder so the existing collator works).
+          ``label = 0`` (placeholder so the existing collator works).
         * Boundary clamp identical to PairDataset: when ``t + k > T - 1`` the
           second slot is clamped to ``T - 1``.
     """
@@ -364,7 +372,7 @@ class BinaryPairInferenceDataset(Dataset):
             "image_mask_t": mask_t,
             "image_mask_tk": mask_tk,
             "prompt": prompt,
-            "label": 0.0,  # placeholder; collator emits but inference ignores
+            "label": 0,  # placeholder; collator emits but inference ignores
             "episode": int(episode),
             "frame_idx_t": int(t),
             "frame_idx_tk": int(t_plus_k),
@@ -488,31 +496,68 @@ def _build_dataloader(
     return loader, len(shard_indices)
 
 
-def _records_from_predict(out, batch: dict[str, Any]) -> list[dict[str, Any]]:
-    """Per-sample row dicts from a single CriticOutput + batch metadata."""
+def _records_from_predict(
+    out,
+    batch: dict[str, Any],
+    *,
+    num_bins: int,
+    stride_k: int,
+) -> list[dict[str, Any]]:
+    """Per-sample row dicts from a single CriticOutput + batch metadata.
+
+    Always emits the same column set regardless of ``num_bins``:
+    binary-mode output computes ``expected_stride_normalized`` and the
+    entropy columns from the 2-wide softmax, so downstream readers don't
+    need to branch on mode.
+    """
     aggregated = out.predicted_values.detach().to("cpu", dtype=torch.float32)
     mean = out.prediction_mean.detach().to("cpu", dtype=torch.float32)
     minv = out.prediction_min.detach().to("cpu", dtype=torch.float32)
     var = out.prediction_variance.detach().to("cpu", dtype=torch.float32)
     members = out.member_predicted_values.detach().to("cpu", dtype=torch.float32)
-    # members: [K, B]
+    # Bin-level quantities. ``out.probs`` is the aggregated softmax
+    # ([B, num_bins]); ``out.member_probs`` is [E, B, num_bins] and was
+    # added to EnsembleCriticOutput in phase A. For ensembles of size 1
+    # (single-model wrapper) E==1 and member-variance columns fall to 0.
+    agg_probs_np = out.probs.detach().to("cpu", dtype=torch.float32).numpy()
+    member_probs = out.member_probs
+    if member_probs is None:
+        raise RuntimeError(
+            "compute_advantages_ensemble expects EnsembleCriticOutput.member_probs "
+            "to be populated; got None. Ensure the checkpoint routes through the "
+            "ensemble wrapper (BinaryValueCriticModel.from_checkpoint returns it "
+            "for ensemble_size >= 1)."
+        )
+    member_probs_np = member_probs.detach().to("cpu", dtype=torch.float32).numpy()
+
+    es = expected_signed_stride(agg_probs_np, stride_k, num_bins) / float(stride_k)
+    entropy_agg = _entropy_nats(agg_probs_np)  # [B]
+    entropy_members = _entropy_nats(member_probs_np)  # [E, B]
+    entropy_member_mean = entropy_members.mean(axis=0)  # [B]
+    entropy_member_variance = entropy_members.var(axis=0, ddof=0)  # [B]
+
     episodes = batch["episode"].tolist()
     frame_t = batch["frame_idx_t"].tolist()
 
     rows: list[dict[str, Any]] = []
     bsize = aggregated.shape[0]
     for i in range(bsize):
-        rows.append(
-            {
-                "episode_index": int(episodes[i]),
-                "frame_index": int(frame_t[i]),
-                "p_progress_aggregated": float(aggregated[i].item()),
-                "p_progress_mean": float(mean[i].item()),
-                "p_progress_min": float(minv[i].item()),
-                "p_progress_variance": float(var[i].item()),
-                "member_values": [float(x) for x in members[:, i].tolist()],
-            }
-        )
+        rows.append({
+            "episode_index": int(episodes[i]),
+            "frame_index": int(frame_t[i]),
+            "p_progress_aggregated": float(aggregated[i].item()),
+            "p_progress_mean": float(mean[i].item()),
+            "p_progress_min": float(minv[i].item()),
+            "p_progress_variance": float(var[i].item()),
+            "member_values": [float(x) for x in members[:, i].tolist()],
+            # Multi-bin additive columns. Binary (num_bins=2) still
+            # gets these: expected_stride_normalized degenerates to a
+            # monotone function of p_progress, entropy is Bernoulli.
+            "expected_stride_normalized": float(es[i]),
+            "entropy_aggregated": float(entropy_agg[i]),
+            "entropy_member_mean": float(entropy_member_mean[i]),
+            "entropy_member_variance": float(entropy_member_variance[i]),
+        })
     return rows
 
 
@@ -527,17 +572,23 @@ def _build_terminal_frame_rows(
     for episode_index, episode_length in enumerate(episode_lengths):
         if int(episode_length) < 1:
             continue
-        rows.append(
-            {
-                "episode_index": int(episode_index),
-                "frame_index": int(episode_length) - 1,
-                "p_progress_aggregated": 0.0,
-                "p_progress_mean": 0.0,
-                "p_progress_min": 0.0,
-                "p_progress_variance": 0.0,
-                "member_values": list(zero_members),
-            }
-        )
+        rows.append({
+            "episode_index": int(episode_index),
+            "frame_index": int(episode_length) - 1,
+            "p_progress_aggregated": 0.0,
+            "p_progress_mean": 0.0,
+            "p_progress_min": 0.0,
+            "p_progress_variance": 0.0,
+            "member_values": list(zero_members),
+            # Terminal default: assume maximal regressive stride
+            # (E[s]/K = -1) and zero entropy — matches the
+            # "default negative" intent of the existing 0.0
+            # p_progress fill.
+            "expected_stride_normalized": 0.0,
+            "entropy_aggregated": 0.0,
+            "entropy_member_mean": 0.0,
+            "entropy_member_variance": 0.0,
+        })
     return pd.DataFrame(rows)
 
 
@@ -558,9 +609,10 @@ def _append_missing_terminal_rows(
         return df, 0
 
     if len(df) == 0:
-        combined = terminal_rows.sort_values(
-            ["episode_index", "frame_index"]
-        ).reset_index(drop=True)
+        combined = terminal_rows.sort_values([
+            "episode_index",
+            "frame_index",
+        ]).reset_index(drop=True)
         return combined, len(combined)
 
     existing_keys = set(
@@ -628,6 +680,9 @@ def _run_inference_for_dataset(
             int(cfg.advantage.batch_size),
         )
 
+    num_bins = int(getattr(model.config, "num_bins", 2))
+    stride_k = int(cfg.data.k)
+
     local_rows: list[dict[str, Any]] = []
     pbar = tqdm(
         loader,
@@ -639,7 +694,9 @@ def _run_inference_for_dataset(
         observation = _move_to_device(batch["observation"], device)
         with torch.inference_mode():
             out = model.predict(observation)
-        local_rows.extend(_records_from_predict(out, batch))
+        local_rows.extend(
+            _records_from_predict(out, batch, num_bins=num_bins, stride_k=stride_k)
+        )
 
     local_df = pd.DataFrame(local_rows)
     if world_size > 1:
@@ -696,6 +753,15 @@ def _finalise_dataframe(
             "p_progress_min",
             "p_progress_variance",
             "member_values",
+            # Multi-bin additive columns. Always present — binary (num_bins=2)
+            # checkpoints populate them from the 2-wide softmax so downstream
+            # readers can assume a single schema. `advantage_continuous`
+            # intentionally stays tied to ``p_progress_aggregated`` (changing
+            # it would silently shift existing CFG threshold semantics).
+            "expected_stride_normalized",
+            "entropy_aggregated",
+            "entropy_member_mean",
+            "entropy_member_variance",
         ]
     ]
 
@@ -716,13 +782,16 @@ def _update_mixture_config(
     positive_threshold: float,
     inference_mode: str,
     ensemble_size: int,
+    num_bins: int,
     total_samples: int,
     num_positive: int,
 ) -> Path:
     """Merge a per-tag entry into ``meta/mixture_config.yaml``.
 
     Preserves any existing top-level keys and any other tags already
-    recorded under ``tags:``.
+    recorded under ``tags:``. ``num_bins`` is recorded so that
+    downstream CFG training can detect which classifier produced this
+    parquet without reopening the checkpoint.
     """
     meta_dir = Path(dataset_path) / "meta"
     cfg_path = meta_dir / "mixture_config.yaml"
@@ -745,6 +814,7 @@ def _update_mixture_config(
         "positive_threshold": float(positive_threshold),
         "inference_mode": str(inference_mode),
         "ensemble_size": int(ensemble_size),
+        "num_bins": int(num_bins),
         "total_samples": int(total_samples),
         "num_positive": int(num_positive),
     }
@@ -843,6 +913,7 @@ def main(cfg: DictConfig) -> None:
                 positive_threshold=threshold,
                 inference_mode=str(model.config.inference_mode),
                 ensemble_size=int(model.config.ensemble_size),
+                num_bins=int(getattr(model.config, "num_bins", 2)),
                 total_samples=total_samples,
                 num_positive=num_positive,
             )

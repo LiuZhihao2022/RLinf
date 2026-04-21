@@ -24,9 +24,10 @@ built around:
 * :class:`~rlinf.data.datasets.cfg.rewind.BinaryPairDataCollator` — runs
   the multi-view :class:`Pistar06ValueProcessor` twice (once per frame) and
   stacks the per-camera image tensors along a new ``num_frames`` axis.
-* The binary forward contract ``model(observation, labels)`` with labels in
-  ``{-1, +1}``. Metrics reported per step / eval run: cross-entropy loss,
-  classification accuracy, and the distribution of ``P(progress)``.
+* The binary forward contract ``model(observation, labels)`` with labels as
+  long bin indices in ``[0, num_bins)`` (binary: 0 = regress, 1 = progress).
+  Metrics reported per step / eval run: cross-entropy loss, classification
+  accuracy, and the distribution of ``P(progress)``.
 """
 
 import logging
@@ -286,11 +287,28 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
         )
         self.processor = processor
         max_token_len = int(getattr(model_cfg, "max_token_len", 200))
+        # num_bins drives both the dataset (label semantics) and the
+        # collator (label tensor dtype); passing the same value to both
+        # keeps the head / loss / metrics contract consistent.
+        num_bins = int(getattr(model_cfg, "num_bins", 2))
+        k = int(data_cfg.get("k", 4))
+        if num_bins > 2 and (2 * k) % num_bins != 0:
+            raise ValueError(
+                "Binary value multi-bin mode requires 2*data.k to be a "
+                f"multiple of model.num_bins; got data.k={k}, "
+                f"model.num_bins={num_bins} (2*k={2 * k})."
+            )
         train_collator = BinaryPairDataCollator(
-            processor=processor, max_length=max_token_len, train=True
+            processor=processor,
+            max_length=max_token_len,
+            train=True,
+            num_bins=num_bins,
         )
         eval_collator = BinaryPairDataCollator(
-            processor=processor, max_length=max_token_len, train=False
+            processor=processor,
+            max_length=max_token_len,
+            train=False,
+            num_bins=num_bins,
         )
 
         # --- DataLoader knobs ---
@@ -356,7 +374,7 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                         ),
                     )
                 ),
-                k=int(data_cfg.get("k", 4)),
+                k=k,
                 include_state=bool(
                     getattr(model_cfg, "include_state_in_prompt", False)
                 ),
@@ -365,6 +383,7 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                 dataset_type=dataset_type,
                 only_success=only_success,
                 min_episode_length=data_cfg.get("min_episode_length", None),
+                num_bins=num_bins,
             )
 
         balance_dataset_weights = bool(
@@ -539,7 +558,7 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
         if not bad_paths:
             return
 
-        label_pos_frac = float((labels > 0).to(dtype=torch.float32).mean().item())
+        label_pos_frac = self._label_pos_frac(labels)
         global_step = int(getattr(self, "global_step", 0))
         precision = getattr(self.cfg.actor.model, "precision", None)
         unique_paths = ", ".join(sorted(set(bad_paths)))
@@ -550,6 +569,18 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             f"Offending tensors: {unique_paths}. "
             "Check precision settings and upstream batch contents."
         )
+
+    def _label_pos_frac(self, labels: torch.Tensor) -> float:
+        """Fraction of "progressive" examples in the batch.
+
+        ``labels`` are long bin indices in ``[0, num_bins)``; progressive
+        bins are the upper half ``[num_bins // 2, num_bins)`` (see
+        ``pair_dataset._signed_stride_to_bin``). For ``num_bins == 2``
+        this degenerates to ``labels == 1``.
+        """
+        num_bins = int(getattr(self.cfg.actor.model, "num_bins", 2))
+        positive_mask = labels >= (num_bins // 2)
+        return float(positive_mask.to(dtype=torch.float32).mean().item())
 
     def _fetch_next_batch(self) -> dict:
         """Return the next training micro-batch; rotate epoch on exhaustion."""
@@ -595,9 +626,7 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             )
             loss = result.loss
         if loss is None:
-            raise RuntimeError(
-                "Binary value model returned no loss during training."
-            )
+            raise RuntimeError("Binary value model returned no loss during training.")
 
         self._raise_if_non_finite_training_step(
             result=result,
@@ -607,23 +636,26 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             grad_accum=grad_accum,
         )
 
-        # p_progress_std is intentionally not logged on the training path: in the
-        # ensemble flow each member trains on its own shuffled micro batch, so the
-        # within-batch std is shuffle noise, not ensemble disagreement. Eval covers
-        # the spread question on shared inputs instead.
+        # signed_progress_std is intentionally not logged on the training path:
+        # in the ensemble flow each member trains on its own shuffled micro
+        # batch, so the within-batch std is shuffle noise, not ensemble
+        # disagreement. Eval covers the spread question on shared inputs
+        # instead.
         metrics: dict[str, float] = {}
         if result.loss is not None:
             metrics["loss"] = float(result.loss.detach().item())
         if result.cat_acc_best is not None:
             metrics["accuracy"] = float(result.cat_acc_best.detach().item())
+        if result.cat_acc_neighbor is not None:
+            metrics["accuracy_neighbor"] = float(
+                result.cat_acc_neighbor.detach().item()
+            )
         if result.predicted_values is not None:
-            metrics["p_progress_mean"] = float(
+            metrics["signed_progress_mean"] = float(
                 result.predicted_values.detach().float().mean().item()
             )
         if labels is not None:
-            metrics["label_pos_frac"] = float(
-                (labels > 0).to(dtype=torch.float32).mean().item()
-            )
+            metrics["label_pos_frac"] = self._label_pos_frac(labels)
 
         scaled_loss = loss / grad_accum
         with backward_ctx:
@@ -812,17 +844,21 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             metrics["loss"] = float(result.loss.detach().item())
         if result.cat_acc_best is not None:
             metrics["accuracy"] = float(result.cat_acc_best.detach().item())
-        if result.predicted_values is not None:
-            probs = result.predicted_values.detach().float()
-            metrics["p_progress_mean"] = float(probs.mean().item())
-            if probs.numel() >= 2:
-                metrics["p_progress_std"] = float(probs.std(unbiased=False).item())
-            else:
-                metrics["p_progress_std"] = 0.0
-        if labels is not None:
-            metrics["label_pos_frac"] = float(
-                (labels > 0).to(dtype=torch.float32).mean().item()
+        if result.cat_acc_neighbor is not None:
+            metrics["accuracy_neighbor"] = float(
+                result.cat_acc_neighbor.detach().item()
             )
+        if result.predicted_values is not None:
+            signed_progress = result.predicted_values.detach().float()
+            metrics["signed_progress_mean"] = float(signed_progress.mean().item())
+            if signed_progress.numel() >= 2:
+                metrics["signed_progress_std"] = float(
+                    signed_progress.std(unbiased=False).item()
+                )
+            else:
+                metrics["signed_progress_std"] = 0.0
+        if labels is not None:
+            metrics["label_pos_frac"] = self._label_pos_frac(labels)
         return metrics
 
     def _eval_batch_ensemble(
@@ -853,19 +889,21 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                 metrics["loss"] = float(result.loss.detach().item())
             if result.cat_acc_best is not None:
                 metrics["accuracy"] = float(result.cat_acc_best.detach().item())
+            if result.cat_acc_neighbor is not None:
+                metrics["accuracy_neighbor"] = float(
+                    result.cat_acc_neighbor.detach().item()
+                )
             if result.predicted_values is not None:
-                probs = result.predicted_values.detach().float()
-                metrics["p_progress_mean"] = float(probs.mean().item())
-                if probs.numel() >= 2:
-                    metrics["p_progress_std"] = float(
-                        probs.std(unbiased=False).item()
+                signed_progress = result.predicted_values.detach().float()
+                metrics["signed_progress_mean"] = float(signed_progress.mean().item())
+                if signed_progress.numel() >= 2:
+                    metrics["signed_progress_std"] = float(
+                        signed_progress.std(unbiased=False).item()
                     )
                 else:
-                    metrics["p_progress_std"] = 0.0
+                    metrics["signed_progress_std"] = 0.0
             if labels is not None:
-                metrics["label_pos_frac"] = float(
-                    (labels > 0).to(dtype=torch.float32).mean().item()
-                )
+                metrics["label_pos_frac"] = self._label_pos_frac(labels)
             member_metrics.append(metrics)
         return self._mean_metrics(member_metrics)
 
@@ -950,9 +988,7 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             // self.cfg.actor.micro_batch_size
             // self._world_size
         )
-        ensemble_size = max(
-            1, int(getattr(self.cfg.actor.model, "ensemble_size", 1))
-        )
+        ensemble_size = max(1, int(getattr(self.cfg.actor.model, "ensemble_size", 1)))
         batches_per_step = grad_accum * ensemble_size
         steps_per_epoch = max(1, loader_len // batches_per_step)
         new_epoch = step // steps_per_epoch
