@@ -62,6 +62,7 @@ class SupportedModel(Enum):
     VALUE_MODEL = ("value_model", "embodied")
     VALUE_MODEL_EVORL = ("value_model_evorl", "embodied")
     BINARY_VALUE_REWIND_ARM = ("binary_value_rewind_arm", "embodied")
+    SUCCESS_FAIL_CLASSIFIER = ("success_fail_classifier", "embodied")
 
     # Sft models
     QWEN2_5_VL_SFT = ("qwen2.5_vl", "sft")

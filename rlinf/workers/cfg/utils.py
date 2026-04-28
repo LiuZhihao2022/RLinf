@@ -12,47 +12,69 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared utilities for CFG (Classifier-Free Guidance) workers.
-
-Contains data loading and dataset wrapper classes used by FSDPCfgWorker.
-"""
+"""Shared utilities for CFG-style embodied data loading."""
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import torch
 
-from rlinf.models.embodiment.openpi_cfg.openpi_cfg_action_model import (
-    Observation as CFGObservation,
-)
-
 logger = logging.getLogger(__name__)
 
 
-def cast_image_features(hf_dataset):
-    """Cast image columns from struct to Image type for proper decoding.
-
-    When parquet files store images as struct<bytes: binary, path: string>,
-    we need to cast them to datasets.Image type for automatic decoding.
+def load_advantages_lookup(
+    data_path: str,
+    advantage_tag: str | None = None,
+) -> dict[tuple[int, int], bool]:
+    """Load an episode/frame advantage lookup from dataset metadata.
 
     Args:
-        hf_dataset: HuggingFace dataset with struct-type image columns.
+        data_path: Path to a LeRobot dataset.
+        advantage_tag: Optional advantage tag. When provided, loads
+            ``meta/advantages_{advantage_tag}.parquet``; otherwise loads
+            ``meta/advantages.parquet``.
 
     Returns:
-        Dataset with image columns cast to Image type.
+        Mapping from ``(episode_index, frame_index)`` to a boolean advantage
+        label.
     """
+    import pandas as pd
+
+    if advantage_tag:
+        meta_path = Path(data_path) / "meta" / f"advantages_{advantage_tag}.parquet"
+    else:
+        meta_path = Path(data_path) / "meta" / "advantages.parquet"
+
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"Advantage file not found: {meta_path}. "
+            "Run compute_advantages.py first."
+        )
+
+    adv_df = pd.read_parquet(meta_path)
+    return dict(
+        zip(
+            zip(
+                adv_df["episode_index"].values.astype(int).tolist(),
+                adv_df["frame_index"].values.astype(int).tolist(),
+            ),
+            adv_df["advantage"].values.astype(bool).tolist(),
+        )
+    )
+
+
+def cast_image_features(hf_dataset: Any) -> Any:
+    """Cast image columns from struct to ``datasets.Image`` for decoding."""
     from datasets import Image
 
-    # Check if casting is needed
     features = hf_dataset.features
     needs_cast = False
     new_features = features.copy()
 
     for key, feat in features.items():
-        # Check if this is a struct-type image (dict feature with 'bytes' field)
-        # The feature type will be a dict like {'bytes': Value(...), 'path': Value(...)}
         if isinstance(feat, dict) and "bytes" in feat:
             new_features[key] = Image()
             needs_cast = True
@@ -67,18 +89,7 @@ def cast_image_features(hf_dataset):
 
 
 class AdvantagePreservingDataset:
-    """Wrapper to preserve advantage through OpenPI transform pipeline.
-
-    OpenPI's RepackTransform removes all keys except required ones, which drops
-    the advantage field. This wrapper pre-builds an index-to-advantage mapping
-    at init time using efficient HF dataset column access (no image loading),
-    avoiding the need to load each sample twice.
-
-    Attributes:
-        _transformed_dataset: Dataset after applying OpenPI transforms.
-        _advantage_by_index: Pre-built mapping from sample index to advantage value.
-        _base_dataset: Kept only as fallback when pre-building fails.
-    """
+    """Wrapper that restores advantage labels after OpenPI transforms."""
 
     def __init__(
         self,
@@ -87,40 +98,25 @@ class AdvantagePreservingDataset:
         advantages_lookup: dict[tuple[int, int], bool] | None = None,
         constant_advantage: bool | None = None,
     ):
-        """Initialize AdvantagePreservingDataset.
-
-        Pre-builds index-to-advantage mapping to avoid loading each sample twice
-        (once from base_dataset for advantage, once from transformed_dataset).
-
-        Args:
-            base_dataset: Base dataset with advantage field (from compute_advantages.py).
-            transformed_dataset: Dataset after applying OpenPI transforms.
-            advantages_lookup: Optional pre-loaded advantage lookup from
-                meta/advantages_{tag}.parquet. If provided, advantage is read
-                from this lookup instead of from the data parquet.
-            constant_advantage: Optional constant advantage label applied to
-                every sample. This is useful for expert-only SFT datasets that
-                should always be treated as positive guidance examples.
-        """
         self._transformed_dataset = transformed_dataset
         self._advantage_by_index = self._build_advantage_index(
             base_dataset, advantages_lookup, constant_advantage
         )
-        # Keep base_dataset only as fallback when pre-building fails
         self._base_dataset = base_dataset if self._advantage_by_index is None else None
+
+    @property
+    def advantage_by_index(self) -> dict[int, bool] | None:
+        """Return the cached index -> advantage mapping when available."""
+        return self._advantage_by_index
 
     @staticmethod
     def _get_hf_dataset(dataset: Any) -> Any:
-        """Extract the underlying HuggingFace dataset from wrapped datasets.
-
-        Traverses TransformedDataset wrappers to find the LeRobotDataset's
-        hf_dataset, which allows efficient column access without image loading.
-        """
+        """Extract the underlying HuggingFace dataset from wrapped datasets."""
         current = dataset
         while current is not None:
             if hasattr(current, "hf_dataset"):
                 return current.hf_dataset
-            elif hasattr(current, "_dataset"):
+            if hasattr(current, "_dataset"):
                 current = current._dataset
             else:
                 return None
@@ -132,15 +128,7 @@ class AdvantagePreservingDataset:
         advantages_lookup: dict[tuple[int, int], bool] | None,
         constant_advantage: bool | None,
     ) -> dict[int, bool] | None:
-        """Build mapping from sample index to advantage value.
-
-        Uses efficient column access on the underlying HF dataset to read
-        episode_index/frame_index or advantage columns without loading images.
-
-        Returns:
-            Dict mapping sample index -> advantage (bool), or None if
-            the HF dataset is not accessible (falls back to slow path).
-        """
+        """Build a mapping from transformed index to advantage label."""
         if constant_advantage is not None:
             return {i: bool(constant_advantage) for i in range(len(base_dataset))}
 
@@ -153,55 +141,41 @@ class AdvantagePreservingDataset:
             return None
 
         if advantages_lookup is not None:
-            # Efficient path: read episode_index and frame_index columns directly
-            # (no image decoding, just integer columns)
             ep_indices = hf_dataset["episode_index"]
             frame_indices = hf_dataset["frame_index"]
-            advantage_by_index = {}
-            missing_keys = []
-            for i in range(len(hf_dataset)):
-                key = (int(ep_indices[i]), int(frame_indices[i]))
+            advantage_by_index: dict[int, bool] = {}
+            missing_keys: list[tuple[int, int]] = []
+            for idx in range(len(hf_dataset)):
+                key = (int(ep_indices[idx]), int(frame_indices[idx]))
                 if key in advantages_lookup:
-                    advantage_by_index[i] = advantages_lookup[key]
+                    advantage_by_index[idx] = advantages_lookup[key]
                 else:
                     missing_keys.append(key)
             if missing_keys:
                 raise ValueError(
                     f"[AdvantagePreservingDataset] {len(missing_keys)} samples not found "
                     f"in advantages lookup (first 5: {missing_keys[:5]}). "
-                    f"The advantages parquet does not match this dataset. "
-                    f"Re-run compute_advantages.py."
+                    "The advantages parquet does not match this dataset. "
+                    "Re-run compute_advantages.py."
                 )
             return advantage_by_index
 
-        elif "advantage" in hf_dataset.column_names:
-            # Fallback: read advantage column directly (no image decoding)
-            advantages = hf_dataset["advantage"]
-            return {i: bool(v) for i, v in enumerate(advantages)}
+        if "advantage" in hf_dataset.column_names:
+            return {
+                idx: bool(value) for idx, value in enumerate(hf_dataset["advantage"])
+            }
 
-        else:
-            raise ValueError(
-                "[AdvantagePreservingDataset] No advantage data found: "
-                "advantages_lookup is None, and 'advantage' column not in dataset. "
-                "Run compute_advantages.py first."
-            )
+        raise ValueError(
+            "[AdvantagePreservingDataset] No advantage data found: "
+            "advantages_lookup is None, and 'advantage' column not in dataset. "
+            "Run compute_advantages.py first."
+        )
 
     def __len__(self) -> int:
         return len(self._transformed_dataset)
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        """Get sample with advantage added.
-
-        Only loads from _transformed_dataset once (no double data loading).
-
-        Args:
-            idx: Sample index.
-
-        Returns:
-            Transformed sample dict with 'advantage' field added.
-        """
-        sample = self._transformed_dataset[idx]
-
+    def get_advantage(self, idx: int) -> bool:
+        """Return the boolean advantage for ``idx``."""
         if self._advantage_by_index is not None:
             if idx not in self._advantage_by_index:
                 raise KeyError(
@@ -209,70 +183,163 @@ class AdvantagePreservingDataset:
                     f"Dataset size: {len(self._transformed_dataset)}, "
                     f"advantage index size: {len(self._advantage_by_index)}."
                 )
-            sample["advantage"] = self._advantage_by_index[idx]
-        else:
-            # Slow fallback: load from base dataset (only when HF dataset not accessible)
-            base_sample = self._base_dataset[idx]
-            if "advantage" not in base_sample:
-                raise KeyError(
-                    f"[AdvantagePreservingDataset] 'advantage' key not found in base_sample "
-                    f"at index {idx}. Run compute_advantages.py first."
-                )
-            advantage = base_sample["advantage"]
-            if isinstance(advantage, torch.Tensor):
-                advantage = bool(advantage.item())
-            sample["advantage"] = advantage
+            return self._advantage_by_index[idx]
 
+        base_sample = self._base_dataset[idx]
+        if "advantage" not in base_sample:
+            raise KeyError(
+                f"[AdvantagePreservingDataset] 'advantage' key not found in base_sample "
+                f"at index {idx}. Run compute_advantages.py first."
+            )
+        advantage = base_sample["advantage"]
+        if isinstance(advantage, torch.Tensor):
+            advantage = bool(advantage.item())
+        return bool(advantage)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        """Get one transformed sample and re-attach its advantage label."""
+        sample = self._transformed_dataset[idx]
+        sample["advantage"] = self.get_advantage(idx)
         return sample
 
 
-class CFGDataLoaderImpl:
-    """DataLoader wrapper for CFG training.
+class PositiveAdvantageOnlySubset(AdvantagePreservingDataset):
+    """Subset wrapper that keeps only ``advantage=True`` samples."""
 
-    Yields (observation, actions, advantage) tuples for CFG model training.
-    The advantage field is used to select positive or negative guidance.
+    def __init__(
+        self,
+        base_dataset: Any,
+        transformed_dataset: Any,
+        advantages_lookup: dict[tuple[int, int], bool] | None = None,
+        constant_advantage: bool | None = None,
+    ):
+        super().__init__(
+            base_dataset=base_dataset,
+            transformed_dataset=transformed_dataset,
+            advantages_lookup=advantages_lookup,
+            constant_advantage=constant_advantage,
+        )
+        self._positive_indices = [
+            idx
+            for idx in range(len(self._transformed_dataset))
+            if self.get_advantage(idx)
+        ]
 
-    Attributes:
-        _data_config: OpenPI data configuration.
-        _data_loader: Underlying PyTorch DataLoader.
-    """
+    def __len__(self) -> int:
+        return len(self._positive_indices)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        return self._transformed_dataset[self._positive_indices[idx]]
+
+
+def fix_episode_data_index(dataset: Any, episodes: list[int]) -> None:
+    """Fix LeRobotDataset episode indices after dataset-level filtering."""
+    ep_idx_mapping = {ep: i for i, ep in enumerate(sorted(episodes))}
+    max_ep_idx = max(episodes) + 1
+
+    old_from = dataset.episode_data_index["from"]
+    old_to = dataset.episode_data_index["to"]
+
+    new_from = torch.full((max_ep_idx,), -1, dtype=old_from.dtype)
+    new_to = torch.full((max_ep_idx,), -1, dtype=old_to.dtype)
+
+    for orig_ep, new_idx in ep_idx_mapping.items():
+        new_from[orig_ep] = old_from[new_idx]
+        new_to[orig_ep] = old_to[new_idx]
+
+    dataset.episode_data_index["from"] = new_from
+    dataset.episode_data_index["to"] = new_to
+
+
+def create_distributed_torch_dataloader(
+    dataset: Any,
+    *,
+    batch_size: int,
+    num_workers: int,
+    world_size: int,
+    rank: int,
+    shuffle: bool = True,
+    prefetch_factor: int | None = None,
+    persistent_workers: bool | None = None,
+    pin_memory: bool = True,
+) -> Any:
+    """Create a PyTorch DataLoader with a distributed sampler when needed."""
+    sampler = None
+
+    if torch.distributed.is_initialized():
+        if batch_size % world_size != 0:
+            raise ValueError(
+                f"batch_size ({batch_size}) must be divisible by world_size ({world_size})"
+            )
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            drop_last=True,
+        )
+        local_batch_size = batch_size // world_size
+    else:
+        local_batch_size = batch_size
+
+    if prefetch_factor is None:
+        prefetch_factor = 4 if num_workers > 0 else None
+    if persistent_workers is None:
+        persistent_workers = num_workers > 0
+
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=local_batch_size,
+        shuffle=(sampler is None and shuffle),
+        sampler=sampler,
+        drop_last=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
+    )
+
+
+class _BaseOpenPIDataLoaderImpl:
+    """Shared wrapper behavior for OpenPI-backed dataloaders."""
 
     def __init__(self, data_config: Any, data_loader: Any):
-        """Initialize CFGDataLoaderImpl.
-
-        Args:
-            data_config: OpenPI data configuration.
-            data_loader: Underlying PyTorch DataLoader.
-        """
         self._data_config = data_config
         self._data_loader = data_loader
 
+    @property
+    def sampler(self) -> Any:
+        """Expose the inner sampler for compatibility with existing workers."""
+        return getattr(self._data_loader, "sampler", None)
+
+    @property
+    def dataset(self) -> Any:
+        """Expose the inner dataset for compatibility with existing workers."""
+        return getattr(self._data_loader, "dataset", None)
+
     def data_config(self) -> Any:
-        """Get data configuration."""
+        """Return the OpenPI data configuration."""
         return self._data_config
 
     def __len__(self) -> int:
-        """Return number of batches."""
         return len(self._data_loader)
 
     def set_epoch(self, epoch: int) -> None:
-        """Forward set_epoch to sampler and dataset for proper shuffling each epoch."""
-        if hasattr(self._data_loader, "sampler") and hasattr(
-            self._data_loader.sampler, "set_epoch"
-        ):
-            self._data_loader.sampler.set_epoch(epoch)
-        # CfgMixtureDataset has set_epoch method
-        if hasattr(self._data_loader, "dataset") and hasattr(
-            self._data_loader.dataset, "set_epoch"
-        ):
-            self._data_loader.dataset.set_epoch(epoch)
+        """Forward ``set_epoch`` to the wrapped sampler and dataset."""
+        if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
+            self.sampler.set_epoch(epoch)
+        if self.dataset is not None and hasattr(self.dataset, "set_epoch"):
+            self.dataset.set_epoch(epoch)
+
+
+class CFGDataLoaderImpl(_BaseOpenPIDataLoaderImpl):
+    """Yield ``(observation, actions, advantage)`` tuples for CFG training."""
 
     def __iter__(self):
-        """Iterate over batches.
+        from rlinf.models.embodiment.openpi_cfg.openpi_cfg_action_model import (
+            Observation as CFGObservation,
+        )
 
-        Yields:
-            Tuple of (observation, actions, advantage) for each batch.
-        """
         for batch in self._data_loader:
             observation = CFGObservation.from_dict(batch)
             actions = batch["actions"]
@@ -282,3 +349,15 @@ class CFGDataLoaderImpl:
                 advantage = torch.tensor(advantage, dtype=torch.bool)
 
             yield observation, actions, advantage
+
+
+class SftPlainDataLoaderImpl(_BaseOpenPIDataLoaderImpl):
+    """Yield plain OpenPI ``(observation, actions)`` tuples for SFT."""
+
+    def __iter__(self):
+        from openpi.models import model as openpi_model
+
+        for batch in self._data_loader:
+            observation = openpi_model.Observation.from_dict(batch)
+            actions = batch["actions"]
+            yield observation, actions

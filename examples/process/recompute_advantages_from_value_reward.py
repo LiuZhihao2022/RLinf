@@ -22,6 +22,15 @@ Uses: A = normalize(reward_sum) + gamma^N * v_next - v_curr
 - unified_threshold from positive_quantile (top X% positive), then update
   advantage (bool) and advantage_continuous columns and mixture_config.
 
+This script targets **value-model** advantage parquets produced by
+``compute_advantages.py``. For ensemble classifier-corrected parquets
+(produced by ``compute_advantages_ensemble.py`` with a configured classifier,
+or ``inject_classifier_into_advantages.py``), use
+``recompute_advantages_ensemble_with_classifier.py`` instead — running this
+script against a classifier-corrected source silently produces semantically
+wrong tags, so ``load_existing_advantages`` now refuses it by default.
+``--force`` overrides the guard at the caller's risk.
+
 Usage:
   # Full recompute (provide --advantage_lookahead_step)
   python recompute_advantages_from_value_reward.py \
@@ -151,11 +160,48 @@ def discover_datasets_and_return_range(
     return dataset_paths, rmin, rmax
 
 
+def _read_tag_meta(dataset_path: Path, source_tag: str | None) -> dict:
+    """Best-effort read of ``<ds>/meta/mixture_config.yaml::tags[source_tag]``.
+
+    Returns an empty dict on any miss — this helper only powers optional
+    metadata-driven guards (see :func:`load_existing_advantages`).
+    """
+    if source_tag is None:
+        return {}
+    cfg_path = dataset_path / "meta" / "mixture_config.yaml"
+    if not cfg_path.exists():
+        return {}
+    try:
+        loaded = yaml.safe_load(cfg_path.read_text())
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(loaded, dict):
+        return {}
+    tags = loaded.get("tags") or {}
+    if not isinstance(tags, dict):
+        return {}
+    entry = tags.get(source_tag)
+    return entry if isinstance(entry, dict) else {}
+
+
 def load_existing_advantages(
     dataset_path: Path,
     source_tag: str | None = None,
+    *,
+    force: bool = False,
 ) -> pd.DataFrame:
-    """Load an existing advantages parquet for threshold reapplication."""
+    """Load an existing advantages parquet for threshold reapplication.
+
+    Raises when the source tag is known to be classifier-corrected, unless
+    ``force=True``. Two independent guards (metadata flag + parquet schema)
+    so either source is enough to block a silent semantic drift:
+
+    * ``tags[source_tag].has_classifier_correction is True``
+    * The parquet carries ``p_fail`` or ``ensemble_signed_score`` columns
+
+    Use the sibling ``recompute_advantages_ensemble_with_classifier.py`` for
+    threshold sweeps on classifier-corrected parquets.
+    """
     adv_filename = (
         f"advantages_{source_tag}.parquet" if source_tag else "advantages.parquet"
     )
@@ -172,6 +218,34 @@ def load_existing_advantages(
     if missing_cols:
         raise ValueError(
             f"Advantage file {adv_path} missing required columns: {sorted(missing_cols)}"
+        )
+
+    tag_meta = _read_tag_meta(dataset_path, source_tag)
+    metadata_flagged = bool(tag_meta.get("has_classifier_correction", False))
+    classifier_cols = [
+        c for c in ("p_fail", "ensemble_signed_score") if c in df.columns
+    ]
+    schema_flagged = bool(classifier_cols)
+    if metadata_flagged or schema_flagged:
+        reasons: list[str] = []
+        if metadata_flagged:
+            reasons.append("mixture_config tag has_classifier_correction=True")
+        if schema_flagged:
+            reasons.append(
+                f"parquet contains classifier-era columns {classifier_cols}"
+            )
+        if not force:
+            raise RuntimeError(
+                f"source tag {source_tag!r} at {adv_path} looks "
+                "classifier-corrected (" + "; ".join(reasons) + "). This script "
+                "is for value-model advantage; running threshold relabel here "
+                "will produce a semantically wrong tag. Use "
+                "recompute_advantages_ensemble_with_classifier.py for ensemble "
+                "classifier-corrected parquets, or pass --force to override."
+            )
+        logger.warning(
+            "--force used despite classifier-corrected source (%s)",
+            "; ".join(reasons),
         )
 
     if "advantage_continuous" not in df.columns:
@@ -638,6 +712,18 @@ def main() -> None:
         action="store_true",
         help="Skip embedding advantages into data parquet files. Only save meta parquet.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Override the classifier-corrected source guard. This script is "
+            "for value-model parquets; running it against a classifier-"
+            "corrected ensemble parquet produces semantically wrong tags. "
+            "Only enable if you truly want to threshold-relabel a corrected "
+            "file — normally you should use "
+            "recompute_advantages_ensemble_with_classifier.py instead."
+        ),
+    )
     args = parser.parse_args()
 
     if bool(args.dataset_root) == bool(args.dataset_paths):
@@ -724,7 +810,9 @@ def main() -> None:
                 f"  {ds_path.name}: {len(df)} advantages, mean={df['advantage'].mean():.4f}"
             )
         else:
-            df = load_existing_advantages(ds_path, source_tag=source_tag)
+            df = load_existing_advantages(
+                ds_path, source_tag=source_tag, force=bool(args.force)
+            )
             all_advantages.append(df["advantage_continuous"].values)
             logger.info(
                 f"  {ds_path.name}: {len(df)} existing advantages, "

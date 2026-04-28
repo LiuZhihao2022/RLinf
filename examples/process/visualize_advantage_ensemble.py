@@ -198,19 +198,62 @@ def _stack_member_values(df: pd.DataFrame) -> np.ndarray:
     return np.stack(rows, axis=1)  # [K, N]
 
 
+def _has_classifier_correction(df: pd.DataFrame, tag_meta: dict) -> bool:
+    """Is this tag a classifier-corrected ensemble advantage parquet?
+
+    Two independent signals: the ``tags[tag].has_classifier_correction`` flag
+    and the presence of ``p_fail`` in the parquet. Either is sufficient.
+    """
+    if bool(tag_meta.get("has_classifier_correction", False)):
+        return True
+    return "p_fail" in df.columns
+
+
+def _data_driven_xrange(values: np.ndarray, pad: float = 0.05) -> tuple[float, float]:
+    """Return ``(lo, hi)`` for histogram / axis bounds. Pads away from data
+    limits so the extreme bins remain visible, and never clips corrected
+    values that fall below ``-1``."""
+    if values.size == 0:
+        return -1.05, 1.05
+    lo = float(np.nanmin(values))
+    hi = float(np.nanmax(values))
+    span = max(hi - lo, 1e-6)
+    return lo - pad * span, hi + pad * span
+
+
 def plot_distribution(
-    df: pd.DataFrame, out_path: Path, threshold: float | None, dataset_name: str, tag: str
+    df: pd.DataFrame, out_path: Path, threshold: float | None, dataset_name: str, tag: str,
+    *, tag_meta: dict | None = None,
 ) -> None:
+    tag_meta = tag_meta or {}
+    corrected = _has_classifier_correction(df, tag_meta)
+
     fig, ax = plt.subplots(figsize=(8, 5))
     adv = df["advantage_continuous"].to_numpy()
+    xlo, xhi = _data_driven_xrange(adv)
     ax.hist(
         adv,
         bins=80,
-        range=(-1.0, 1.0),
+        range=(xlo, xhi),
         color="steelblue",
         edgecolor="black",
         alpha=0.75,
+        label="advantage_continuous",
     )
+    # Overlay raw ensemble_signed_score when it differs from advantage_continuous
+    # (corrected parquets). The raw signal stays in [-1, 1] so it's a useful
+    # reference to inspect how much the classifier pulled each sample down.
+    if corrected and "ensemble_signed_score" in df.columns:
+        raw = df["ensemble_signed_score"].to_numpy()
+        ax.hist(
+            raw,
+            bins=80,
+            range=(xlo, xhi),
+            color="tab:gray",
+            alpha=0.35,
+            histtype="stepfilled",
+            label="ensemble_signed_score (raw)",
+        )
     ax.axvline(
         x=float(np.mean(adv)),
         color="green",
@@ -227,12 +270,23 @@ def plot_distribution(
             linewidth=2.0,
             label=f"threshold = {threshold:.3f}  (positive: {n_pos}/{len(adv)})",
         )
-    ax.set_xlim(-1.0, 1.0)
-    ax.set_xlabel(
-        "aggregated signed progress  (= advantage_continuous, wco picks worst member)"
+    ax.set_xlim(xlo, xhi)
+    xlabel = (
+        "advantage_continuous (signed score, classifier-corrected)"
+        if corrected
+        else "advantage_continuous (aggregated signed progress)"
     )
+    ax.set_xlabel(xlabel)
     ax.set_ylabel("count")
-    ax.set_title(f"Aggregated signed progress — {dataset_name}\ntag = {tag}")
+    title = f"Advantage distribution — {dataset_name}\ntag = {tag}"
+    if corrected:
+        lam = tag_meta.get("classifier_lambda")
+        ft = tag_meta.get("classifier_fail_threshold")
+        if lam is not None and ft is not None:
+            title += f"  [corrected λ={lam} t={ft}]"
+        else:
+            title += "  [corrected]"
+    ax.set_title(title)
     ax.legend(loc="upper left")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -422,8 +476,15 @@ def plot_episode_timelines(
             f"episode {ep}  (T={len(sub)}, pos_rate={pos_rate:.2f})", fontsize=10
         )
         ax.set_xlabel("frame_index")
-        ax.set_ylabel("signed progress")
-        ax.set_ylim(-1.0, 1.0)
+        ax.set_ylabel("signed progress / advantage_continuous")
+        # Data-driven y-range so classifier-corrected parquets (where
+        # advantage_continuous can go below -1) are not clipped.
+        y_lo, y_hi = _data_driven_xrange(
+            np.concatenate([member_min, member_max, agg]), pad=0.02
+        )
+        # Never shrink below the native [-1, 1] envelope so uncorrected
+        # parquets keep their familiar view.
+        ax.set_ylim(min(y_lo, -1.02), max(y_hi, 1.02))
         ax.grid(True, alpha=0.3)
         if ax_idx == 0:
             ax.legend(loc="lower right", fontsize=8)
@@ -451,7 +512,7 @@ def write_summary(
     out_path: Path,
 ) -> None:
     members = _stack_member_values(df)  # [K, N]
-    summary = {
+    summary: dict = {
         "dataset": dataset_name,
         "tag": tag,
         "parquet": str(parquet_path),
@@ -477,6 +538,20 @@ def write_summary(
         },
         "per_member_mean_p_progress": [float(members[k].mean()) for k in range(members.shape[0])],
     }
+    if "ensemble_signed_score" in df.columns:
+        summary["ensemble_signed_score"] = {
+            "mean": float(df["ensemble_signed_score"].mean()),
+            "std": float(df["ensemble_signed_score"].std()),
+            "min": float(df["ensemble_signed_score"].min()),
+            "max": float(df["ensemble_signed_score"].max()),
+        }
+    if "p_fail" in df.columns:
+        summary["p_fail"] = {
+            "mean": float(df["p_fail"].mean()),
+            "std": float(df["p_fail"].std()),
+            "min": float(df["p_fail"].min()),
+            "max": float(df["p_fail"].max()),
+        }
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -488,18 +563,43 @@ def write_summary(
 
 def _build_progress_by_frame_from_df(df_for_episode: pd.DataFrame) -> dict:
     """Convert per-episode parquet rows into the score-bundle dict expected
-    by ``_collect_episode_frames``. Frames missing from the parquet (e.g.
-    the very last frame of an episode, which has no valid t+k pair) are
-    handled by the collector via fallback to the previous value."""
+    by ``_collect_episode_frames``.
+
+    Field semantics:
+      * ``value`` — decision score used for threshold highlight in the shared
+        render path. Always equals ``advantage_continuous`` so threshold logic
+        stays consistent between legacy and classifier-corrected parquets.
+      * ``raw_score`` — raw ``ensemble_signed_score`` when available (post-PR
+        parquets); falls back to ``advantage_continuous`` for legacy
+        parquets where the two are equal.
+      * ``p_fail`` / ``logit_fail`` — classifier outputs, present only on
+        inject / correction parquets.
+
+    Frames missing from the parquet (e.g. terminal frames that had no valid
+    ``t+k`` pair pre-terminal-fill) are handled by the collector via fallback
+    to the previous value.
+    """
+    has_ess = "ensemble_signed_score" in df_for_episode.columns
+    has_pfail = "p_fail" in df_for_episode.columns
+    has_logit = "logit_fail" in df_for_episode.columns
+
     out: dict[int, dict[str, object]] = {}
     for row in df_for_episode.itertuples(index=False):
-        out[int(row.frame_index)] = {
+        entry: dict[str, object] = {
             "value": float(row.advantage_continuous),
+            "raw_score": float(
+                getattr(row, "ensemble_signed_score", row.advantage_continuous)
+            ) if has_ess else float(row.advantage_continuous),
             "value_mean": float(row.p_progress_mean),
             "value_min": float(row.p_progress_min),
             "value_variance": float(row.p_progress_variance),
             "member_values": [float(x) for x in row.member_values],
         }
+        if has_pfail:
+            entry["p_fail"] = float(row.p_fail)
+        if has_logit:
+            entry["logit_fail"] = float(row.logit_fail)
+        out[int(row.frame_index)] = entry
     return out
 
 
@@ -612,12 +712,20 @@ def render_per_episode(
     seed: int,
     write_video: bool,
     fps: int,
+    explicit_episodes: list[int] | None = None,
+    classifier_fail_threshold: float | None = None,
+    classifier_lambda: float | None = None,
 ) -> list[Path]:
     """Render per-episode summary PNGs (and optionally MP4s) into output_dir.
 
     Reuses the rendering helpers from
     ``visualize_episodes_with_binary_value.py`` so the output layout
     matches ``logs/viz_binary/pnp_eval_ckpt8000_k8_ensemble4_10eps``.
+
+    If ``explicit_episodes`` is non-empty it bypasses the strategy-based
+    selection entirely — every listed episode present in both the parquet
+    and the LeRobot dataset is rendered (missing ones are warned and
+    skipped).
     """
     from visualize_episodes_with_binary_value import (
         _collect_episode_frames,
@@ -631,8 +739,25 @@ def render_per_episode(
     print(f"Opening LeRobot dataset {dataset_path}")
     lerobot_ds, ep_starts, ep_ends, tasks = _open_lerobot_dataset(dataset_path)
     eligible = set(range(len(ep_starts)))
-    selected = _select_episode_indices(df, num_episodes, strategy, seed, eligible)
-    print(f"Selected episodes ({strategy}): {selected}")
+    if explicit_episodes:
+        requested = [int(e) for e in explicit_episodes]
+        parquet_eps = set(df["episode_index"].astype(int).tolist())
+        selected = [e for e in requested if e in eligible and e in parquet_eps]
+        missing = sorted(set(requested) - set(selected))
+        if missing:
+            print(
+                f"  warning: {len(missing)} episodes in --explicit-episodes are "
+                f"not in both parquet and LeRobot dataset; skipping: {missing}"
+            )
+        if not selected:
+            raise RuntimeError(
+                "None of the explicit episodes are present in both parquet "
+                f"and dataset. requested={requested}"
+            )
+        print(f"Selected episodes (explicit): {selected}")
+    else:
+        selected = _select_episode_indices(df, num_episodes, strategy, seed, eligible)
+        print(f"Selected episodes ({strategy}): {selected}")
 
     image_keys = detect_image_keys(lerobot_ds[int(ep_starts[selected[0]])])
     print(f"Detected image keys: {image_keys}")
@@ -667,6 +792,8 @@ def render_per_episode(
             decision_threshold=threshold,
             stride_k=stride_k,
             inference_mode=inference_mode,
+            classifier_fail_threshold=classifier_fail_threshold,
+            classifier_lambda=classifier_lambda,
         )
         written.append(summary_path)
 
@@ -679,6 +806,8 @@ def render_per_episode(
                 stride_k=stride_k,
                 inference_mode=inference_mode,
                 fps=fps,
+                classifier_fail_threshold=classifier_fail_threshold,
+                classifier_lambda=classifier_lambda,
             )
             written.append(video_path)
 
@@ -759,6 +888,17 @@ def main() -> None:
         "--episode-seed", type=int, default=42, help="RNG seed for random strategy."
     )
     parser.add_argument(
+        "--explicit-episodes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated explicit episode ids (e.g. '7,22,29,66'). When "
+            "provided, --num-episodes / --episode-strategy / --episode-seed "
+            "are ignored and every listed episode present in both parquet "
+            "and dataset is rendered."
+        ),
+    )
+    parser.add_argument(
         "--no-video",
         action="store_true",
         help="Skip MP4 generation (PNG summaries still produced).",
@@ -797,8 +937,14 @@ def main() -> None:
     print(f"Threshold = {threshold}")
     print(f"Output dir = {args.output}")
 
+    tag_meta = _read_mixture_meta(args.dataset, args.tag)
     plot_distribution(
-        df, args.output / "distribution.png", threshold, dataset_name, args.tag
+        df,
+        args.output / "distribution.png",
+        threshold,
+        dataset_name,
+        args.tag,
+        tag_meta=tag_meta,
     )
     plot_member_distributions(
         df, args.output / "members.png", dataset_name, args.tag
@@ -825,9 +971,29 @@ def main() -> None:
         df, parquet_path, threshold, dataset_name, args.tag, args.output / "summary.json"
     )
 
-    if args.num_episodes > 0:
+    explicit_eps = None
+    if args.explicit_episodes:
+        try:
+            explicit_eps = [
+                int(x) for x in args.explicit_episodes.split(",") if x.strip()
+            ]
+        except ValueError as exc:
+            raise SystemExit(
+                f"--explicit-episodes must be comma-separated integers, "
+                f"got {args.explicit_episodes!r} ({exc})"
+            )
+        if not explicit_eps:
+            raise SystemExit("--explicit-episodes resolved to an empty list")
+
+    run_per_episode = args.num_episodes > 0 or bool(explicit_eps)
+    if run_per_episode:
         meta = _read_mixture_meta(args.dataset, args.tag)
         inference_mode = str(meta.get("inference_mode", "wco"))
+        # Classifier-correction metadata — only populated when the tag was
+        # produced by an inject / ensemble-with-classifier run. None leaves
+        # the overlays suppressed inside the render helpers.
+        clf_fail_thresh = meta.get("classifier_fail_threshold")
+        clf_lambda = meta.get("classifier_lambda")
         episodes_dir = args.output / "episodes"
         render_per_episode(
             df=df,
@@ -841,6 +1007,13 @@ def main() -> None:
             seed=int(args.episode_seed),
             write_video=not args.no_video,
             fps=int(args.fps),
+            explicit_episodes=explicit_eps,
+            classifier_fail_threshold=(
+                float(clf_fail_thresh) if clf_fail_thresh is not None else None
+            ),
+            classifier_lambda=(
+                float(clf_lambda) if clf_lambda is not None else None
+            ),
         )
 
     print("Wrote:")

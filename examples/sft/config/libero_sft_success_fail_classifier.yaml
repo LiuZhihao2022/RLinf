@@ -1,0 +1,172 @@
+# Frame-level Success/Fail Classifier SFT — RLinf FSDP runner.
+#
+# Usage:
+#   bash examples/sft/run_success_fail_classifier.sh libero_sft_success_fail_classifier
+#
+# The classifier is trained on a rollout LeRobot dataset (mixed success +
+# fail episodes). Per-frame labels are broadcast from each episode's
+# is_success flag — see rlinf/data/datasets/cfg/success_fail_dataset.py
+# for the exact scan logic.
+#
+# Required environment variables (set in run_success_fail_classifier.sh
+# or overridden at the shell before invocation):
+#   SUCCESS_FAIL_DATA_ROOT  — LeRobot dataset root (absolute path)
+#   LIBERO_NORM_STATS_DIR   — directory with norm_stats.json
+#   DINOV2_PATH             — local DINOv2-small checkpoint; leave unset
+#                              to pull from HuggingFace `facebook/dinov2-small`
+#
+# Smoke testing (10 steps, no eval, no save): append
+#   runner.max_epochs=10 runner.max_steps=10 \
+#   runner.val_check_interval=-1 runner.save_interval=-1
+# to the bash invocation.
+
+defaults:
+  - model/success_fail_classifier@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "success_fail_classifier_sft"
+    logger_backends: ["tensorboard"]
+
+  # Prod training defaults. Smoke overrides at the CLI — see header.
+  max_epochs: 30
+  max_steps: -1
+  val_check_interval: 500
+  save_interval: 2000
+
+data:
+  # One or more LeRobot datasets. Each entry must have dataset_path;
+  # `type: rollout` triggers per-episode is_success scan, `type: sft`
+  # treats every episode as success (label 0).
+  #
+  # Paths are rooted at ``${oc.env:SUCCESS_FAIL_DATA_ROOT}`` so a clean
+  # clone only needs the env var set (see run_success_fail_classifier.sh).
+  train_data_paths:
+    # SFT dataset is all-success by convention; suppress the
+    # "no fail episodes" guard for this entry only — class balance
+    # comes from the rollout dataset below.
+    - dataset_path: ${oc.env:SUCCESS_FAIL_DATA_ROOT}/libero_10_3shot_collect_512_task0_fail30/libero_10_3shot
+      type: sft
+      robot_type: libero
+      weight: 1.0
+      include_fail: false
+    - dataset_path: ${oc.env:SUCCESS_FAIL_DATA_ROOT}/libero_10_3shot_collect_512_task0_fail30/collected_data_3shot_512_task0_merged_for_eval
+      type: rollout
+      robot_type: libero
+      weight: 1.0
+  eval_data_paths:
+    - dataset_path: ${oc.env:SUCCESS_FAIL_DATA_ROOT}/libero_10_3shot_collect_512_task0_fail30/collected_data_3shot_512_task0_merged_for_eval
+      type: rollout
+      robot_type: libero
+  balance_weights: true
+  seed: 42
+  dataset_type: rollout
+
+  # Camera views matched against LeRobot keys. Missing views become
+  # placeholders with mask=False at the collator stage.
+  camera_keys:
+    - image
+    - wrist_image
+  state_key: state
+
+  # Proprioceptive state normalisation. Must match the inference-time
+  # build_input_transforms path inside compute_advantages.py so training
+  # and inference see the same [-1, 1] / padded-to-max_state_dim state.
+  robot_type: libero
+  model_type: pi05
+  action_dim: 32
+  default_prompt: null
+  norm_stats_dir: ${oc.env:LIBERO_NORM_STATS_DIR}
+  asset_id: null
+
+  # Class balance policy. See the worker's _parse_pos_weight_mode helper.
+  # Options: "auto" | "none" | "batch_adaptive" | <float>.
+  pos_weight_mode: auto
+
+  # Episode filtering — both flags default to True (want mixed success + fail
+  # to train the classifier). Set one to False to make a pure-class loader
+  # (e.g. building a second val loader over only fail episodes).
+  include_success: true
+  include_fail: true
+  min_episode_length: 1
+
+  # Loader knobs
+  train_num_workers: 8
+  eval_num_workers: 4
+  prefetch_factor: 4
+  persistent_workers: true
+  pin_memory: false
+
+algorithm:
+  adv_type: gae   # unused here — retained for config shape parity
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 64
+  global_batch_size: 512
+  seed: 0
+
+  # `actor.model` defaults come from model/success_fail_classifier.yaml.
+  model:
+    precision: fp32
+    # DINOv2-s backbone. Replace with a local snapshot path or leave the
+    # placeholder and rely on `model/success_fail_classifier.yaml`'s default
+    # (`facebook/dinov2-small`) by removing this override.
+    vision_repo_id: /path/to/dinov2-small
+    image_size: 224
+    use_proprio: true
+    proprio_dim: 32
+    proprio_hidden: 128
+    max_state_dim: 32
+    hidden_dim: 256
+    dropout: 0.1
+    label_smoothing: 0.1
+    freeze_vision: false
+    use_gradient_checkpointing: false
+
+  optim:
+    lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-4
+    clip_grad: 10.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 500
+    total_training_steps: 10000
+    min_lr: 1.0e-6
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    use_orig_params: true
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

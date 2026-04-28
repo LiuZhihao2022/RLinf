@@ -21,7 +21,6 @@ CfgMixtureDataset for weighted sampling across datasets.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 
 import jax
@@ -40,6 +39,9 @@ from rlinf.workers.cfg.utils import (
     AdvantagePreservingDataset,
     CFGDataLoaderImpl,
     cast_image_features,
+    create_distributed_torch_dataloader,
+    fix_episode_data_index,
+    load_advantages_lookup,
 )
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
@@ -94,40 +96,8 @@ class FSDPCfgWorker(FSDPSftWorker):
         data_path: str,
         advantage_tag: str | None = None,
     ) -> dict[tuple[int, int], bool]:
-        """Load advantage lookup from meta/advantages_{tag}.parquet or meta/advantages.parquet.
-
-        Args:
-            data_path: Path to LeRobot dataset.
-            advantage_tag: Advantage tag name. If None, loads meta/advantages.parquet.
-
-        Returns:
-            Dict mapping (episode_index, frame_index) -> bool.
-        """
-        import pandas as pd
-
-        if advantage_tag:
-            meta_path = Path(data_path) / "meta" / f"advantages_{advantage_tag}.parquet"
-        else:
-            meta_path = Path(data_path) / "meta" / "advantages.parquet"
-
-        if not meta_path.exists():
-            raise FileNotFoundError(
-                f"Advantage file not found: {meta_path}. "
-                f"Run compute_advantages.py first."
-            )
-
-        adv_df = pd.read_parquet(meta_path)
-
-        lookup = dict(
-            zip(
-                zip(
-                    adv_df["episode_index"].values.astype(int).tolist(),
-                    adv_df["frame_index"].values.astype(int).tolist(),
-                ),
-                adv_df["advantage"].values.astype(bool).tolist(),
-            )
-        )
-        return lookup
+        """Backward-compatible wrapper around the shared lookup loader."""
+        return load_advantages_lookup(data_path, advantage_tag)
 
     def build_dataloader(self):
         """Build CFG dataloader with advantage-weighted sampling across datasets."""
@@ -250,8 +220,11 @@ class FSDPCfgWorker(FSDPSftWorker):
             seed=data_cfg.get("seed", 42),
         )
 
+        data_num_workers = int(data_cfg.get("num_workers", config.num_workers))
         torch_data_loader = self._create_torch_dataloader(
-            combined_dataset, config, openpi_data_loader
+            combined_dataset,
+            batch_size=config.batch_size,
+            num_workers=data_num_workers,
         )
 
         data_loader = CFGDataLoaderImpl(data_config, torch_data_loader)
@@ -288,58 +261,24 @@ class FSDPCfgWorker(FSDPSftWorker):
         LeRobotDataset has a bug where episode_data_index doesn't match the
         original episode indices when filtering by episodes. This fixes that.
         """
-        ep_idx_mapping = {ep: i for i, ep in enumerate(sorted(episodes))}
-        max_ep_idx = max(episodes) + 1
-
-        old_from = dataset.episode_data_index["from"]
-        old_to = dataset.episode_data_index["to"]
-
-        new_from = torch.full((max_ep_idx,), -1, dtype=old_from.dtype)
-        new_to = torch.full((max_ep_idx,), -1, dtype=old_to.dtype)
-
-        for orig_ep, new_idx in ep_idx_mapping.items():
-            new_from[orig_ep] = old_from[new_idx]
-            new_to[orig_ep] = old_to[new_idx]
-
-        dataset.episode_data_index["from"] = new_from
-        dataset.episode_data_index["to"] = new_to
+        fix_episode_data_index(dataset, episodes)
 
     def _create_torch_dataloader(
         self,
         dataset: Any,
-        config: Any,
-        openpi_data_loader: Any,
+        *,
+        batch_size: int,
+        num_workers: int,
         shuffle: bool = True,
     ) -> Any:
         """Create PyTorch DataLoader with distributed sampler."""
-        batch_size = config.batch_size
-        sampler = None
-
-        if torch.distributed.is_initialized():
-            sampler = torch.utils.data.distributed.DistributedSampler(
-                dataset,
-                num_replicas=self._world_size,
-                rank=self._rank,
-                shuffle=shuffle,
-                drop_last=True,
-            )
-            local_batch_size = batch_size // self._world_size
-        else:
-            local_batch_size = batch_size
-
-        # Use data config overrides if available, otherwise fall back to OpenPI defaults.
-        data_cfg = self.cfg.get("data", {})
-        num_workers = int(data_cfg.get("num_workers", config.num_workers))
-        return torch.utils.data.DataLoader(
+        return create_distributed_torch_dataloader(
             dataset,
-            batch_size=local_batch_size,
-            shuffle=(sampler is None and shuffle),
-            sampler=sampler,
-            drop_last=True,
+            batch_size=batch_size,
             num_workers=num_workers,
-            pin_memory=True,
-            prefetch_factor=4 if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
+            world_size=self._world_size,
+            rank=self._rank,
+            shuffle=shuffle,
         )
 
     def run_training(self):

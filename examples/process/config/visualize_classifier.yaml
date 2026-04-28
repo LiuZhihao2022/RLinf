@@ -1,0 +1,73 @@
+# Per-episode visualization for the frame-level Success/Fail Classifier.
+#
+# Works with any trained SuccessFailClassifier checkpoint. Every `model.*`
+# knob defaults to null — SuccessFailClassifier.from_checkpoint will then
+# read the value from the saved config.json. Override on the CLI only when
+# you deliberately want to diverge from the trained setting.
+#
+# Usage:
+#   cd examples/process && python visualize_episodes_with_classifier.py \
+#       visualize.checkpoint_dir=/path/to/ckpt/global_step_N/actor \
+#       data.train_data_paths.0.dataset_path=/path/to/dataset \
+#       model.vision_repo_id=/path/to/dinov2-small \
+#       +visualize.num_episodes=5 \
+#       +visualize.output_dir=./viz_classifier_out
+
+visualize:
+  # REQUIRED — trained SuccessFailClassifier checkpoint dir. Accepts either
+  # `.../global_step_N` or `.../global_step_N/actor`.
+  checkpoint_dir: /path/to/success_fail_ckpt/actor
+  output_dir: ./viz_classifier_episodes
+  num_episodes: 10
+  episodes: null            # explicit list; overrides num_episodes
+  seed: 42
+  fps: 10
+  no_video: false
+  dataset_index: 0
+  batch_size: 32
+  num_workers: 4
+  # P(fail) >= threshold ⇒ classified as fail-like. Default 0.5 matches
+  # the BCE decision boundary.
+  decision_threshold: 0.5
+  # Trailing-mean window for the third curve panel.
+  smooth_window: 10
+  device: "cuda"
+
+model:
+  # Vision backbone is required in principle, but when left null the value
+  # from the checkpoint's config.json is used (that's what's trained with).
+  vision_repo_id: null
+  use_proprio: null
+  proprio_dim: null
+  image_size: null
+  label_smoothing: null
+  max_state_dim: null
+  precision: null
+
+data:
+  train_data_paths:
+    - dataset_path: /path/to/dataset
+      type: rollout
+      robot_type: libero
+  camera_keys:
+    - image
+    - wrist_image
+  state_key: state
+  robot_type: libero
+  model_type: pi05
+  action_dim: 32
+  default_prompt: null
+  # Norm stats directory — only needed when the classifier uses proprio
+  # state (checkpoint's use_proprio=True). Leave null otherwise.
+  norm_stats_dir: null
+  asset_id: null
+  include_success: true
+  include_fail: true
+  min_episode_length: 1
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false

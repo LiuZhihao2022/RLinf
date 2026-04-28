@@ -28,6 +28,23 @@ advantage:
   tag: null
   returns_tag: null
 
+  # Optional frame-level success/fail classifier correction.
+  # When classifier_checkpoint is set, Phase 1.5 runs the classifier in
+  # parallel with V(o_t) and the final advantage uses
+  # V_final = V_orig - classifier_lambda * logit.
+  # Default (null checkpoint) → pipeline behaves exactly as before.
+  classifier_checkpoint: null
+  classifier_lambda: 0.5
+  classifier_batch_size: null   # defaults to advantage.batch_size when null
+  classifier_model:             # optional per-run overrides for classifier config
+    vision_repo_id: null        # e.g. "facebook/dinov2-small"
+    use_proprio: null
+    proprio_dim: null
+    image_size: null
+    label_smoothing: null
+    precision: null
+    max_state_dim: null
+
   model:
     critic_expert_variant: "gemma_1m"
     tokenizer_path: /path/to/gemma-3-270m

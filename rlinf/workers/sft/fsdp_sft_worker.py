@@ -149,7 +149,9 @@ class FSDPSftWorker(FSDPModelManager, Worker):
                     logging.info(
                         f"[INFO] data_iter exhausted, reset iterator self._data_epoch {self._data_epoch}"
                     )
-                    if hasattr(self.data_loader, "sampler") and hasattr(
+                    if hasattr(self.data_loader, "set_epoch"):
+                        self.data_loader.set_epoch(self._data_epoch)
+                    elif hasattr(self.data_loader, "sampler") and hasattr(
                         self.data_loader.sampler, "set_epoch"
                     ):
                         self.data_loader.sampler.set_epoch(self._data_epoch)

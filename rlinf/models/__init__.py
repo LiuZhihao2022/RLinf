@@ -17,6 +17,8 @@ from omegaconf import DictConfig
 from rlinf.config import SupportedModel, get_supported_model, torch_dtype_from_precision
 from rlinf.scheduler import Worker
 
+LINGBOTVLA_MODEL = getattr(SupportedModel, "LINGBOTVLA", None)
+
 
 def get_model(cfg: DictConfig):
     model_type = get_supported_model(cfg.model_type)
@@ -38,6 +40,8 @@ def get_model(cfg: DictConfig):
         from rlinf.models.embodiment.value_model_evorl import get_model
     elif model_type == SupportedModel.BINARY_VALUE_REWIND_ARM:
         from rlinf.models.embodiment.value_model_rewind_arm import get_model
+    elif model_type == SupportedModel.SUCCESS_FAIL_CLASSIFIER:
+        from rlinf.models.embodiment.success_fail_classifier import get_model
     elif model_type == SupportedModel.MLP_POLICY:
         from rlinf.models.embodiment.mlp_policy import get_model
     elif model_type == SupportedModel.GR00T:
@@ -46,7 +50,7 @@ def get_model(cfg: DictConfig):
         from rlinf.models.embodiment.cnn_policy import get_model
     elif model_type == SupportedModel.FLOW_POLICY:
         from rlinf.models.embodiment.flow_policy import get_model
-    elif model_type == SupportedModel.LINGBOTVLA:
+    elif LINGBOTVLA_MODEL is not None and model_type == LINGBOTVLA_MODEL:
         from rlinf.models.embodiment.lingbotvla import get_model
     else:
         return None

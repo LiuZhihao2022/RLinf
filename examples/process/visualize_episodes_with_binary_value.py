@@ -517,6 +517,16 @@ def _collect_episode_frames(
         "signed_progress_min": [],
         "signed_progress_variance": [],
         "member_signed_progress": [],
+        # Parquet-driven caller (visualize_advantage_ensemble) threads two
+        # extra per-frame fields via ``score_bundle``: ``raw_score`` (the
+        # uncorrected ensemble_signed_score) and ``p_fail`` (classifier
+        # probability). When classifier correction is applied they let the
+        # summary figure show the penalty offset and the classifier signal
+        # independently. Checkpoint-driven mode does not populate them, so
+        # the defaults below (raw == signed_progress, p_fail == NaN) make
+        # the summary plot collapse back to the legacy single-line layout.
+        "raw_signed_progress": [],
+        "p_fail": [],
         "task": "",
         "episode_index": episode_index,
         # num_bins lets the plot path branch consistently; 2 = binary
@@ -583,6 +593,17 @@ def _collect_episode_frames(
             data["member_signed_progress"].append(
                 list(score_bundle.get("member_values", [float(score_bundle["value"])]))
             )
+            # Classifier-correction overlays (parquet-driven caller only).
+            # For legacy score bundles these keys are absent → raw falls back
+            # to the corrected value (no visible offset), p_fail becomes NaN
+            # so the classifier panel path is suppressed.
+            data["raw_signed_progress"].append(
+                float(score_bundle.get("raw_score", score_bundle["value"]))
+            )
+            p_fail_val = score_bundle.get("p_fail")
+            data["p_fail"].append(
+                float(p_fail_val) if p_fail_val is not None else float("nan")
+            )
             if is_multi_bin:
                 data["aggregated_probs"].append(list(score_bundle["aggregated_probs"]))
                 data["member_probs"].append([
@@ -610,6 +631,8 @@ def _collect_episode_frames(
             data["member_signed_progress"].append(
                 data["member_signed_progress"][-1].copy()
             )
+            data["raw_signed_progress"].append(data["raw_signed_progress"][-1])
+            data["p_fail"].append(data["p_fail"][-1])
             if is_multi_bin:
                 data["aggregated_probs"].append(data["aggregated_probs"][-1].copy())
                 data["member_probs"].append([
@@ -629,6 +652,8 @@ def _collect_episode_frames(
             data["signed_progress_min"].append(0.0)
             data["signed_progress_variance"].append(0.0)
             data["member_signed_progress"].append([0.0] * default_member_count)
+            data["raw_signed_progress"].append(0.0)
+            data["p_fail"].append(float("nan"))
             if is_multi_bin:
                 data["aggregated_probs"].append(list(default_agg_probs))
                 data["member_probs"].append([list(m) for m in default_member_probs])
@@ -656,6 +681,8 @@ def _create_episode_summary_plot(
     stride_k: int = 0,
     inference_mode: str = "mo",
     figsize: tuple[int, int] = (14, 10),
+    classifier_fail_threshold: float | None = None,
+    classifier_lambda: float | None = None,
 ) -> None:
     """Sampled frames + per-pair V_t + cumulative signed progress.
 
@@ -669,6 +696,14 @@ def _create_episode_summary_plot(
     ``E[signed stride] / K`` curve with ensemble band, and a per-frame
     entropy curve. Binary-mode episodes render the exact same layout
     as before.
+
+    When ``ep_data`` carries classifier-correction overlays (``p_fail``
+    non-NaN and/or ``raw_signed_progress`` differing from
+    ``signed_progress``), the score panel gets a dashed "Raw" trace and
+    an extra ``P(fail)`` panel is inserted right after it; the hline on
+    the new panel lives at ``classifier_fail_threshold``. Legacy /
+    checkpoint-driven callers leave both overlays NaN / trivial, which
+    keeps the figure identical to the previous layout.
     """
     frames = ep_data["frames"]
     n_frames = len(frames)
@@ -694,25 +729,49 @@ def _create_episode_summary_plot(
     )
     num_bins = int(ep_data.get("num_bins", 2))
     is_multi_bin = num_bins > 2
-    # Binary: 2 or 3 curve rows (signed progress, optional variance, cumulative).
-    # Multi-bin adds 3 rows (heatmap, E[stride]/K, entropy).
-    curve_rows = (3 if has_ensemble else 2) + (3 if is_multi_bin else 0)
 
-    # Multi-bin heatmap gets a taller row; other curve rows stay at 1.
-    height_ratios = [1] * n_cameras + [1] * (curve_rows - (1 if is_multi_bin else 0))
+    # Classifier-correction overlays: present iff the parquet-driven caller
+    # populated ``raw_signed_progress`` (differing from ``signed_progress``)
+    # and/or ``p_fail`` (non-NaN). ``raw`` alone without any correction
+    # matches ``signed_progress`` exactly — we only draw an extra line when
+    # the two diverge by more than numerical noise.
+    raw_signed_progress = np.asarray(
+        ep_data.get("raw_signed_progress", []), dtype=np.float64
+    )
+    p_fail_arr = np.asarray(ep_data.get("p_fail", []), dtype=np.float64)
+    has_raw_overlay = (
+        raw_signed_progress.size == len(frames)
+        and np.any(np.abs(raw_signed_progress - np.asarray(ep_data["signed_progress"], dtype=np.float64)) > 1e-6)
+    )
+    has_p_fail_panel = p_fail_arr.size == len(frames) and np.isfinite(p_fail_arr).any()
+
+    # Binary layout: 2 or 3 curve rows (signed progress, optional variance, cumulative).
+    # Multi-bin adds 3 rows (heatmap, E[stride]/K, entropy).
+    # Classifier panel (when enabled) is inserted right after the score
+    # panel — before variance / cumulative / multi-bin extras.
+    curve_rows = (
+        (3 if has_ensemble else 2)
+        + (1 if has_p_fail_panel else 0)
+        + (3 if is_multi_bin else 0)
+    )
+
+    # Per-row heights. Multi-bin heatmap gets 2× height; all others are 1.
+    non_heatmap_rows = curve_rows - (3 if is_multi_bin else 0)
+    height_ratios = [1] * n_cameras + [1] * non_heatmap_rows
     if is_multi_bin:
-        # Insert the heatmap height (2×) as the first extra row after the
-        # existing curves. See gs allocation below.
-        height_ratios = [1] * n_cameras + [1] * (3 if has_ensemble else 2) + [2, 1, 1]
-        if len(height_ratios) != n_cameras + curve_rows:
-            raise RuntimeError(
-                f"Internal: height_ratios length {len(height_ratios)} != "
-                f"n_cameras + curve_rows = {n_cameras + curve_rows}"
-            )
+        # Heatmap + E[stride] + entropy: [2, 1, 1]
+        height_ratios = [1] * n_cameras + [1] * non_heatmap_rows + [2, 1, 1]
+    if len(height_ratios) != n_cameras + curve_rows:
+        raise RuntimeError(
+            f"Internal: height_ratios length {len(height_ratios)} != "
+            f"n_cameras + curve_rows = {n_cameras + curve_rows}"
+        )
 
     if figsize[1] < 10 and is_multi_bin:
         # Scale figure height with extra rows so panels don't look squished.
         figsize = (figsize[0], max(figsize[1] + 4, 12))
+    if has_p_fail_panel:
+        figsize = (figsize[0], figsize[1] + 2)
 
     fig = plt.figure(figsize=figsize)
     gs = gridspec.GridSpec(
@@ -796,11 +855,31 @@ def _create_episode_summary_plot(
                 linewidth=1.0,
                 label=f"Member {member_idx}",
             )
-    aggregated_label = (
-        f"Aggregated ({inference_mode.upper()}, stride k={stride_k})"
-        if has_ensemble
-        else f"{inference_mode.upper()} score (stride k={stride_k})"
-    )
+    if has_raw_overlay:
+        aggregated_label = (
+            f"Corrected ({inference_mode.upper()}, stride k={stride_k})"
+            if has_ensemble
+            else f"Corrected {inference_mode.upper()} (stride k={stride_k})"
+        )
+    else:
+        aggregated_label = (
+            f"Aggregated ({inference_mode.upper()}, stride k={stride_k})"
+            if has_ensemble
+            else f"{inference_mode.upper()} score (stride k={stride_k})"
+        )
+    # Raw ensemble_signed_score (uncorrected) — shown only when it differs
+    # from the corrected value. Dashed gray so the aggregated/corrected
+    # black line remains the primary reference.
+    if has_raw_overlay:
+        ax_p.plot(
+            frames,
+            raw_signed_progress,
+            color="tab:gray",
+            linestyle="--",
+            linewidth=1.5,
+            alpha=0.85,
+            label="Raw ensemble_signed_score",
+        )
     ax_p.plot(
         frames,
         signed_progress,
@@ -832,13 +911,62 @@ def _create_episode_summary_plot(
     ax_p.set_ylabel(f"{inference_mode.upper()} score")
     ax_p.set_ylim(value_ymin, value_ymax)
     ax_p.set_xlim(frames[0], frames[-1])
-    ax_p.legend(loc="upper left", fontsize=7, ncol=2 if has_ensemble else 1)
+    ax_p.legend(loc="upper left", fontsize=7, ncol=2 if (has_ensemble or has_raw_overlay) else 1)
     ax_p.grid(True, alpha=0.3)
     ax_p.tick_params(labelbottom=False)
 
-    cumulative_row = n_cameras + 1
+    # ---- Classifier P(fail) panel (inserted after the score panel) ----
+    row_cursor = n_cameras + 1
+    if has_p_fail_panel:
+        ax_f = fig.add_subplot(gs[row_cursor, :], sharex=ax_p)
+        ax_f.plot(
+            frames,
+            p_fail_arr,
+            color="tab:red",
+            linewidth=1.5,
+            label="P(fail) = sigmoid(logit_fail)",
+        )
+        if classifier_fail_threshold is not None:
+            ax_f.axhline(
+                y=float(classifier_fail_threshold),
+                color="orange",
+                linestyle="--",
+                linewidth=1.2,
+                alpha=0.9,
+                label=f"fail_threshold={float(classifier_fail_threshold):.2f}",
+            )
+        # Neutral 0.5 reference so the reader sees "would the classifier
+        # vote fail" at a glance independent of the hinge threshold.
+        ax_f.axhline(y=0.5, color="gray", linestyle=":", linewidth=0.8, alpha=0.7)
+        # Shade the hinge-active region (p_fail > classifier_fail_threshold)
+        # so it's obvious which frames get penalised downstream.
+        if classifier_fail_threshold is not None:
+            thr = float(classifier_fail_threshold)
+            active = p_fail_arr > thr
+            if np.any(active):
+                ax_f.fill_between(
+                    frames,
+                    p_fail_arr,
+                    thr,
+                    where=active,
+                    alpha=0.18,
+                    color="tab:red",
+                    label="Hinge-active (λ-penalty applies)",
+                )
+        panel_title = "Classifier P(fail)"
+        if classifier_lambda is not None:
+            panel_title += f"  [λ={float(classifier_lambda):g}]"
+        ax_f.set_ylabel(panel_title)
+        ax_f.set_ylim(-0.02, 1.02)
+        ax_f.set_xlim(frames[0], frames[-1])
+        ax_f.legend(loc="upper left", fontsize=7)
+        ax_f.grid(True, alpha=0.3)
+        ax_f.tick_params(labelbottom=False)
+        row_cursor += 1
+
+    cumulative_row = row_cursor
     if has_ensemble:
-        ax_v = fig.add_subplot(gs[n_cameras + 1, :], sharex=ax_p)
+        ax_v = fig.add_subplot(gs[row_cursor, :], sharex=ax_p)
         ax_v.plot(
             frames,
             value_variance,
@@ -852,7 +980,7 @@ def _create_episode_summary_plot(
         ax_v.legend(loc="upper left", fontsize=8)
         ax_v.grid(True, alpha=0.3)
         ax_v.tick_params(labelbottom=False)
-        cumulative_row = n_cameras + 2
+        cumulative_row = row_cursor + 1
 
     # Final row: cumulative signed progress Σ V_t. Members share colors
     # with the top panel so each trace is easy to follow across both
@@ -1054,8 +1182,17 @@ def _create_episode_video(
     fps: int = 10,
     figsize: tuple[int, int] = (14, 9),
     dpi: int = 100,
+    classifier_fail_threshold: float | None = None,
+    classifier_lambda: float | None = None,
 ) -> None:
-    """Animated episode with camera views, V_t and cumulative signed-progress curves."""
+    """Animated episode with camera views, V_t and cumulative signed-progress curves.
+
+    When the parquet-driven caller populates classifier overlays
+    (``raw_signed_progress`` / ``p_fail``), the video gets a dashed "Raw"
+    overlay on the score panel and an extra P(fail) panel between it and
+    the variance/cumulative panels. Legacy callers leave the overlays
+    trivial → the video layout is unchanged.
+    """
     frames = ep_data["frames"]
     n_frames = len(frames)
     if n_frames == 0:
@@ -1075,17 +1212,43 @@ def _create_episode_video(
     )
     num_bins = int(ep_data.get("num_bins", 2))
     is_multi_bin = num_bins > 2
+
+    raw_signed_progress = np.asarray(
+        ep_data.get("raw_signed_progress", []), dtype=np.float64
+    )
+    p_fail_arr = np.asarray(ep_data.get("p_fail", []), dtype=np.float64)
+    has_raw_overlay = (
+        raw_signed_progress.size == len(frames)
+        and np.any(np.abs(raw_signed_progress - np.asarray(ep_data["signed_progress"], dtype=np.float64)) > 1e-6)
+    )
+    has_p_fail_panel = p_fail_arr.size == len(frames) and np.isfinite(p_fail_arr).any()
+
     # Base rows: 1 (cameras) + (signed progress) + (variance?) + (cumulative)
-    # Multi-bin adds 3 more: heatmap, E[s]/K, entropy.
-    grid_rows = (4 if has_ensemble else 3) + (3 if is_multi_bin else 0)
+    # Multi-bin adds 3 more: heatmap, E[s]/K, entropy. Classifier panel
+    # (optional) inserts one extra row right after the score panel.
+    grid_rows = (
+        (4 if has_ensemble else 3)
+        + (1 if has_p_fail_panel else 0)
+        + (3 if is_multi_bin else 0)
+    )
+
+    # Height ratios. Camera row is 2×; heatmap is 2×; all other rows are 1×.
+    non_heatmap_rows = grid_rows - (3 if is_multi_bin else 0)
+    base_ratios = [2] + [1] * (non_heatmap_rows - 1)
     if is_multi_bin:
-        # Heatmap gets 2× height for readability; E[s]/K and entropy at 1×.
-        base_ratios = [2] + [1] * ((4 if has_ensemble else 3) - 1)
         height_ratios = base_ratios + [2, 1, 1]
     else:
-        height_ratios = [2] + [1] * (grid_rows - 1)
+        height_ratios = base_ratios
+    if len(height_ratios) != grid_rows:
+        raise RuntimeError(
+            f"Internal: video height_ratios length {len(height_ratios)} != "
+            f"grid_rows = {grid_rows}"
+        )
+
     if is_multi_bin and figsize[1] < 12:
         figsize = (figsize[0], figsize[1] + 4)
+    if has_p_fail_panel:
+        figsize = (figsize[0], figsize[1] + 2)
 
     fig = plt.figure(figsize=figsize, dpi=dpi)
     gs = gridspec.GridSpec(
@@ -1130,11 +1293,24 @@ def _create_episode_video(
                 linewidth=0.9,
                 label=f"Member {member_idx}",
             )
-    aggregated_label = (
-        f"Aggregated ({inference_mode.upper()})"
-        if has_ensemble
-        else f"{inference_mode.upper()} score"
-    )
+    if has_raw_overlay:
+        aggregated_label = f"Corrected ({inference_mode.upper()})"
+    else:
+        aggregated_label = (
+            f"Aggregated ({inference_mode.upper()})"
+            if has_ensemble
+            else f"{inference_mode.upper()} score"
+        )
+    if has_raw_overlay:
+        ax_p.plot(
+            frames,
+            raw_signed_progress,
+            color="tab:gray",
+            linestyle="--",
+            linewidth=1.3,
+            alpha=0.85,
+            label="Raw ensemble_signed_score",
+        )
     ax_p.plot(
         frames,
         signed_progress,
@@ -1158,11 +1334,44 @@ def _create_episode_video(
     ax_p.set_xlim(frames[0], frames[-1])
     ax_p.set_ylim(value_ymin, value_ymax)
     ax_p.grid(True, alpha=0.3)
-    ax_p.legend(loc="upper left", fontsize=7, ncol=2 if has_ensemble else 1)
+    ax_p.legend(
+        loc="upper left", fontsize=7, ncol=2 if (has_ensemble or has_raw_overlay) else 1
+    )
     ax_p.tick_params(labelbottom=False)
 
-    variance_row = 2 if has_ensemble else None
-    cumulative_row = 3 if has_ensemble else 2
+    # ---- Optional classifier P(fail) panel (row 2 when enabled) ----
+    row_cursor = 2
+    ax_f = None
+    if has_p_fail_panel:
+        ax_f = fig.add_subplot(gs[row_cursor, :], sharex=ax_p)
+        ax_f.plot(
+            frames, p_fail_arr, color="tab:red", linewidth=1.2,
+            label="P(fail)",
+        )
+        if classifier_fail_threshold is not None:
+            ax_f.axhline(
+                y=float(classifier_fail_threshold),
+                color="orange",
+                linestyle="--",
+                linewidth=1.1,
+                alpha=0.9,
+                label=f"fail_threshold={float(classifier_fail_threshold):.2f}",
+            )
+        ax_f.axhline(y=0.5, color="gray", linestyle=":", linewidth=0.8, alpha=0.7)
+        title_bits = "Classifier P(fail)"
+        if classifier_lambda is not None:
+            title_bits += f"  [λ={float(classifier_lambda):g}]"
+        ax_f.set_title(title_bits, fontsize=10)
+        ax_f.set_ylabel("P(fail)")
+        ax_f.set_ylim(-0.02, 1.02)
+        ax_f.set_xlim(frames[0], frames[-1])
+        ax_f.legend(loc="upper left", fontsize=7)
+        ax_f.grid(True, alpha=0.3)
+        ax_f.tick_params(labelbottom=False)
+        row_cursor += 1
+
+    variance_row = row_cursor if has_ensemble else None
+    cumulative_row = row_cursor + (1 if has_ensemble else 0)
     ax_v = None
     if has_ensemble:
         ax_v = fig.add_subplot(gs[variance_row, :], sharex=ax_p)
@@ -1415,6 +1624,22 @@ def _create_episode_video(
         (marker_v,) = ax_v.plot(
             [frames[0]], [value_variance[0]], "o", color="tab:red", markersize=7
         )
+    marker_f = None
+    if ax_f is not None:
+        # p_fail may legitimately be NaN for filler-frames; guard the marker.
+        init_val = (
+            float(p_fail_arr[0])
+            if np.isfinite(p_fail_arr[0])
+            else float(np.nan)
+        )
+        (marker_f,) = ax_f.plot(
+            [frames[0]],
+            [0.0 if not np.isfinite(init_val) else init_val],
+            "o",
+            color="tab:red",
+            markersize=7,
+            markeredgecolor="black",
+        )
     (marker_c,) = ax_c.plot(
         [frames[0]], [cum_signed_progress[0]], "o", color="tab:purple", markersize=8
     )
@@ -1440,6 +1665,14 @@ def _create_episode_video(
         marker_p.set_data([frames[frame_num]], [signed_progress[frame_num]])
         if marker_v is not None:
             marker_v.set_data([frames[frame_num]], [value_variance[frame_num]])
+        if marker_f is not None:
+            pf_val = float(p_fail_arr[frame_num])
+            # NaN (filler frame) would make matplotlib drop the marker;
+            # fall back to 0.0 so the cursor stays on the axis.
+            marker_f.set_data(
+                [frames[frame_num]],
+                [pf_val if np.isfinite(pf_val) else 0.0],
+            )
         marker_c.set_data(
             [frames[frame_num]], [cum_signed_progress[frame_num]]
         )
@@ -1474,6 +1707,8 @@ def _create_episode_video(
         animated_items = camera_ims + [marker_p, marker_c]
         if marker_v is not None:
             animated_items.append(marker_v)
+        if marker_f is not None:
+            animated_items.append(marker_f)
         if hm_cursor is not None:
             animated_items.append(hm_cursor)
         if es_marker is not None:

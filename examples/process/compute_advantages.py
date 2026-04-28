@@ -632,6 +632,8 @@ def compute_advantages_for_dataset(
     global_return_max: float = 0.0,
     global_pbar: tqdm | None = None,
     returns_sidecar: dict[int, dict[str, np.ndarray]] | None = None,
+    classifier=None,
+    classifier_lambda: float = 0.0,
 ) -> pd.DataFrame:
     """Compute advantages for dataset (or shard in distributed mode).
 
@@ -730,6 +732,13 @@ def compute_advantages_for_dataset(
         "reward_sum_raw": [],
         "num_valid_rewards": [],
     }
+    # classifier_logit column tracks the raw logit produced by the Phase 1.5
+    # success/fail classifier. Kept alongside value_current so downstream
+    # λ-sweep scripts can recompute V_final = V_orig - λ·logit without
+    # rerunning GPU inference. Only populated when a classifier is provided.
+    classifier_enabled = classifier is not None and classifier_lambda != 0.0
+    if classifier_enabled:
+        results["classifier_logit"] = []
 
     v_curr_stats = RunningStats("V(o_t)")
     v_next_stats = RunningStats("V(o_N)")
@@ -925,6 +934,104 @@ def compute_advantages_for_dataset(
                 f"Phase 1 incomplete: {missing_count}/{extended_size} entries were not filled."
             )
 
+    # Phase 1.5: optional success/fail classifier correction.
+    # Runs only when a classifier was attached by main(). Builds its own
+    # dataloader because the Phase 1 loader ran value-model-specific
+    # CPU-prep (tokenizer + SigLIP normalization); the classifier expects
+    # DINOv2 ImageNet-normalized tensors instead.
+    clf_logits = (
+        np.zeros(extended_size, dtype=np.float32) if classifier_enabled else None
+    )
+    if classifier_enabled:
+        if rank == 0:
+            logger.info(
+                "Phase 1.5: applying classifier correction "
+                f"V_final = V_orig - {classifier_lambda} * logit"
+            )
+        clf_processor = getattr(classifier, "processor", None)
+        if clf_processor is None:
+            raise RuntimeError(
+                "classifier was provided to compute_advantages_for_dataset "
+                "but classifier.processor is None. Ensure "
+                "SuccessFailClassifier.from_checkpoint / attach_runtime_assets "
+                "was called upstream."
+            )
+        clf_worker_cpu_prep = partial(
+            classifier.__class__._prepare_observation_cpu, processor=clf_processor
+        )
+        clf_advantage_dataset = ValueInferenceDataset(
+            dataset,
+            robot_type,
+            tasks,
+            input_transform=classifier._input_transform
+            if cpu_prep_in_workers
+            else None,
+            prepare_observation_cpu=clf_worker_cpu_prep
+            if cpu_prep_in_workers
+            else None,
+            returns_sidecar=None,  # returns not needed for classifier forward
+        )
+        clf_extended_dataset = torch.utils.data.Subset(
+            clf_advantage_dataset, extended_indices
+        )
+        clf_batch_size_cfg = cfg.advantage.get("classifier_batch_size", None)
+        clf_batch_size = (
+            int(clf_batch_size_cfg) if clf_batch_size_cfg else int(batch_size)
+        )
+        clf_loader = torch.utils.data.DataLoader(
+            clf_extended_dataset,
+            batch_size=clf_batch_size,
+            num_workers=num_dataloader_workers_per_gpu,
+            prefetch_factor=prefetch_factor
+            if num_dataloader_workers_per_gpu > 0
+            else None,
+            persistent_workers=num_dataloader_workers_per_gpu > 0,
+            collate_fn=advantage_collate_fn,
+            shuffle=False,
+            pin_memory=True,
+        )
+
+        clf_pbar = tqdm(
+            total=extended_size,
+            desc=f"[Rank {rank}] Phase 1.5 classifier",
+            unit="samples",
+            disable=rank != 0,
+            dynamic_ncols=True,
+            file=sys.stdout,
+        )
+        for obs_list, meta_list in clf_loader:
+            raw_logits = classifier.predict_logit_batch(
+                obs_list,
+                batch_size=clf_batch_size,
+                pretransformed=cpu_prep_in_workers,
+                already_cpu_prepared=cpu_prep_in_workers,
+            )
+            if len(raw_logits) != len(meta_list):
+                raise RuntimeError(
+                    "Mismatch between classifier outputs and metadata: "
+                    f"{len(raw_logits)} vs {len(meta_list)}"
+                )
+            for logit_val, meta_info in zip(raw_logits, meta_list):
+                local_idx = int(meta_info["global_idx"]) - shard_start
+                if local_idx < 0 or local_idx >= extended_size:
+                    raise RuntimeError(
+                        "classifier local_idx out of range: "
+                        f"{local_idx}, extended_size={extended_size}"
+                    )
+                clf_logits[local_idx] = float(logit_val)
+            clf_pbar.update(len(meta_list))
+        clf_pbar.close()
+
+        if rank == 0:
+            logger.info(
+                "Phase 1.5 done: clf_logits mean=%.4f, std=%.4f, "
+                "min=%.4f, max=%.4f",
+                float(clf_logits.mean()),
+                float(clf_logits.std()),
+                float(clf_logits.min()),
+                float(clf_logits.max()),
+            )
+
     # Phase 2: compute advantages using precomputed V(o_t) values
     for i in range(shard_size):
         gidx = shard_start + i
@@ -938,9 +1045,9 @@ def compute_advantages_for_dataset(
         is_next_pad = next_gidx >= ep_end
         num_valid = min(action_horizon, ep_end - gidx)
 
-        v_curr = float(v_values[i])
+        v_curr_raw = float(v_values[i])
         if is_next_pad:
-            v_next = 0.0
+            v_next_raw = 0.0
             next_local_idx = None
         else:
             next_local_idx = next_gidx - shard_start
@@ -950,7 +1057,24 @@ def compute_advantages_for_dataset(
                     f"{next_local_idx}, extended_size={extended_size}, "
                     f"gidx={gidx}, next_gidx={next_gidx}"
                 )
-            v_next = float(v_values[next_local_idx])
+            v_next_raw = float(v_values[next_local_idx])
+
+        # Classifier correction (scheme A): subtract λ·logit_curr from
+        # advantage directly, leaving v_curr / v_next at their raw V_orig
+        # values. The naive "V_final = V_orig - λ·logit" scheme applied to
+        # both endpoints gives `A_final = A_orig + λ·(logit_curr - γ^k·logit_next)`,
+        # which **raises** advantage for connected bad-frame segments
+        # (lc ≈ ln) — defeating the whole point. Scheme A treats the
+        # classifier as a direct advantage penalty on the current frame
+        # only, which is stable across connected bad-frame windows.
+        # value_current / value_next in the parquet stay raw (V_orig) so a
+        # λ-sweep can recompute advantage without rerunning GPU inference.
+        if classifier_enabled:
+            logit_curr = float(clf_logits[i])
+        else:
+            logit_curr = None
+        v_curr = v_curr_raw
+        v_next = v_next_raw
 
         if abs(gamma - 1.0) < 1e-8:
             if is_next_pad:
@@ -972,20 +1096,30 @@ def compute_advantages_for_dataset(
         reward_sum = normalize(reward_sum_raw)
         gamma_k = gamma**num_valid if discount_next_value else 1.0
         advantage = reward_sum + gamma_k * v_next - v_curr
+        if classifier_enabled:
+            advantage = advantage - classifier_lambda * logit_curr
 
-        v_curr_stats.update(v_curr)
-        v_next_stats.update(v_next)
+        # Stats track RAW values for cross-run comparability. Classifier
+        # correction only affects the ``advantage`` column; ``value_current``
+        # / ``value_next`` stats are still interpretable as V_orig.
+        v_curr_stats.update(v_curr_raw)
+        v_next_stats.update(v_next_raw)
         reward_sum_raw_stats.update(reward_sum_raw)
 
         results["episode_index"].append(ep_idx)
         results["frame_index"].append(frame_idx)
         results["advantage"].append(advantage)
         results["return"].append(true_return)
-        results["value_current"].append(v_curr)
-        results["value_next"].append(v_next)
+        # value_current / value_next are stored raw (V_orig) for λ-sweep
+        # reproducibility — downstream tools can recompute V_final from
+        # value_current + classifier_logit + chosen λ without a GPU run.
+        results["value_current"].append(v_curr_raw)
+        results["value_next"].append(v_next_raw)
         results["reward_sum"].append(reward_sum)
         results["reward_sum_raw"].append(reward_sum_raw)
         results["num_valid_rewards"].append(num_valid)
+        if classifier_enabled:
+            results["classifier_logit"].append(float(logit_curr))
 
         if (i + 1) % flush_every_samples == 0:
             flush_results_to_disk()
@@ -1127,6 +1261,65 @@ def main(cfg: DictConfig) -> None:
                 **_parse_value_model_kwargs(cfg), device=device
             )
 
+        # Optional: frame-level success/fail classifier for V_final correction.
+        # When ``advantage.classifier_checkpoint`` is set, the classifier runs
+        # in Phase 1.5 and the ``advantage`` column reflects
+        # V_final = V_orig - λ · logit. Default unset → behaviour matches
+        # pre-classifier builds exactly (guarded by classifier_enabled flag in
+        # compute_advantages_for_dataset).
+        classifier = None
+        classifier_lambda = float(cfg.advantage.get("classifier_lambda", 0.0))
+        classifier_ckpt = cfg.advantage.get("classifier_checkpoint", None)
+        if classifier_ckpt:
+            from rlinf.models.embodiment.success_fail_classifier import (
+                SuccessFailClassifier,
+            )
+
+            clf_data_cfg = cfg.data
+            clf_robot_type = clf_data_cfg.get("robot_type", "libero")
+            if (
+                "train_data_paths" in clf_data_cfg
+                and len(clf_data_cfg.train_data_paths) > 0
+            ):
+                clf_robot_type = clf_data_cfg.train_data_paths[0].get(
+                    "robot_type", clf_robot_type
+                )
+            clf_model_cfg = cfg.advantage.get("classifier_model", {}) or {}
+            # action_dim drives ``PadStatesAndActions`` in the inference
+            # transform pipeline; must match the value the training worker
+            # used or state padding lengths diverge between train/infer.
+            # Worker reads ``data.action_dim`` (fsdp_frame_classifier_sft_
+            # worker.py build_dataloader), so prefer that here and only
+            # fall back to the legacy ``advantage.model.action_dim`` for
+            # configs predating this fix.
+            clf_action_dim = int(
+                clf_data_cfg.get(
+                    "action_dim",
+                    cfg.advantage.get("model", {}).get("action_dim", 32),
+                )
+            )
+            classifier = SuccessFailClassifier.from_checkpoint(
+                classifier_ckpt,
+                device=device,
+                env_type=clf_robot_type,
+                model_type=clf_data_cfg.get("model_type", "pi05"),
+                default_prompt=clf_data_cfg.get("default_prompt", None),
+                vision_repo_id=clf_model_cfg.get("vision_repo_id", None),
+                use_proprio=clf_model_cfg.get("use_proprio", None),
+                proprio_dim=clf_model_cfg.get("proprio_dim", None),
+                image_size=clf_model_cfg.get("image_size", None),
+                label_smoothing=clf_model_cfg.get("label_smoothing", None),
+                precision=clf_model_cfg.get("precision", None),
+                max_state_dim=clf_model_cfg.get("max_state_dim", None),
+                action_dim=clf_action_dim,
+            )
+            if rank == 0:
+                logger.info(
+                    "Loaded SuccessFailClassifier from %s (λ=%s)",
+                    classifier_ckpt,
+                    classifier_lambda,
+                )
+
         all_advantages = []
         dataset_results = {}
 
@@ -1234,6 +1427,8 @@ def main(cfg: DictConfig) -> None:
                 global_return_max=global_return_max,
                 global_pbar=global_pbar,
                 returns_sidecar=returns_sidecar,
+                classifier=classifier,
+                classifier_lambda=classifier_lambda,
             )
 
             if world_size > 1:

@@ -14,19 +14,50 @@
 
 """
 Compute advantages for CFG-RL training using a trained ensemble
-BinaryValueCriticModel (ARM + ReWiND).
+BinaryValueCriticModel (ARM + ReWiND), with an optional classifier-based
+advantage correction.
 
-Per-frame advantage = ensemble-aggregated p(progress) for the pair
-``(frame_t, frame_{t+k})``. The label written to the parquet is
-``True`` iff ``p(progress) > positive_threshold`` (or unconditionally
-``True`` for ``dataset_type == "sft"``).
+Per-frame ``ensemble_signed_score`` = ensemble-aggregated signed bin-weighted
+expectation in ``[-1, 1]`` for the pair ``(frame_t, frame_{t+k})`` (see
+:class:`rlinf.models.embodiment.value_model_rewind_arm.modeling_critic.
+CriticOutput.predicted_values`). For binary (``num_bins=2``) it degenerates to
+``2 · P(progress) - 1``; for multi-bin it is a signed bin expectation.
+
+The final per-frame scalar written as ``advantage_continuous`` is:
+
+    * without classifier: ``advantage_continuous = ensemble_signed_score``
+    * with classifier:    ``advantage_continuous = ensemble_signed_score
+                           - λ · max(p_fail - classifier_fail_threshold, 0)``
+
+The boolean ``advantage`` label is ``True`` for every frame in ``sft``
+datasets (they are success demos by construction) and, for ``rollout``
+datasets, is derived from ``advantage_continuous`` under one of two
+mutually-exclusive modes selected via ``advantage.label_mode``:
+
+    * ``label_mode: threshold`` — ``advantage = advantage_continuous >
+      advantage.positive_threshold``, where ``positive_threshold`` is a
+      signed-score threshold in ``[-1, 1]`` (NOT a probability).
+    * ``label_mode: quantile`` — pool ``advantage_continuous`` across every
+      rollout dataset and compute the ``(1 - advantage.positive_quantile)``-th
+      percentile; any rollout frame strictly above that cross-dataset
+      threshold is labelled True. ``advantage.positive_quantile`` must be in
+      ``(0, 1)``; e.g. ``0.3`` ⇒ top 30% rollout frames by
+      ``advantage_continuous``.
+
+``advantage.label_mode`` is **required** — there is no default. The resulting
+``unified_threshold`` (equal to ``positive_threshold`` in threshold mode, or
+the computed percentile in quantile mode) is recorded in each dataset's
+``tags[tag].positive_threshold`` for downstream consumers.
 
 Output: ``meta/advantages_{tag}.parquet`` per dataset, with columns
 ``[episode_index, frame_index, advantage, advantage_continuous,
-   p_progress_mean, p_progress_min, p_progress_variance, member_values]``.
-Terminal frames are backfilled with zero progress so the saved parquet covers
-every frame expected by CFG training.
-``mixture_config.yaml`` under ``meta/`` is updated with a per-tag entry.
+   ensemble_signed_score, p_progress_mean, p_progress_min, p_progress_variance,
+   member_values, expected_stride_normalized, entropy_aggregated,
+   entropy_member_mean, entropy_member_variance]`` plus ``[p_fail, logit_fail]``
+if the classifier is enabled. Terminal frames are backfilled with zero
+``ensemble_signed_score``. ``mixture_config.yaml`` under ``meta/`` is updated
+with a per-tag entry that now also records ``label_mode`` (and
+``positive_quantile`` in quantile mode).
 
 Usage:
     python compute_advantages_ensemble.py \\
@@ -35,6 +66,17 @@ Usage:
     # Multi-GPU
     torchrun --nproc_per_node=4 compute_advantages_ensemble.py \\
         --config-name compute_advantages_ensemble_fail150_k8_ensemble4_wco
+
+    # Override at the CLI: quantile mode, top 30% rollout frames positive
+    torchrun --nproc_per_node=4 compute_advantages_ensemble.py \\
+        --config-name compute_advantages_..._wco \\
+        advantage.label_mode=quantile advantage.positive_quantile=0.3
+
+    # With optional classifier correction (λ·hinge on P(fail))
+    torchrun --nproc_per_node=4 compute_advantages_ensemble.py \\
+        --config-name compute_advantages_..._with_classifier \\
+        advantage.classifier.lambda=1.0 \\
+        advantage.classifier.fail_threshold=0.4
 """
 
 import logging
@@ -399,6 +441,27 @@ class BinaryPairInferenceDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 
+def _first_non_none(*values):
+    """Return the first value that is neither ``None`` nor an empty string.
+
+    Use this instead of ``cfg.get(key, fallback)`` whenever the config may
+    explicitly contain ``key: null`` — ``.get`` returns ``None`` in that case
+    and the fallback is skipped. Example::
+
+        default_prompt = _first_non_none(
+            cfg.data.get("default_prompt"),
+            cfg.data.get("prompt"),
+        )
+    """
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, str) and v == "":
+            continue
+        return v
+    return None
+
+
 def _validate_cfg(cfg: DictConfig) -> None:
     """Hard-fail on configuration mistakes — no silent fallbacks."""
     if "advantage" not in cfg:
@@ -410,15 +473,58 @@ def _validate_cfg(cfg: DictConfig) -> None:
     if not ckpt or not Path(ckpt).exists():
         raise FileNotFoundError(f"value_checkpoint does not exist: {ckpt!r}")
 
-    threshold = cfg.advantage.get("positive_threshold")
-    if threshold is None:
-        raise ValueError("advantage.positive_threshold is required")
-    threshold = float(threshold)
-    if not (0.0 <= threshold <= 1.0):
+    label_mode = cfg.advantage.get("label_mode")
+    if label_mode is None:
         raise ValueError(
-            f"positive_threshold must be in [0, 1] (it is a probability); "
-            f"got {threshold}"
+            "advantage.label_mode is required; must be 'threshold' or 'quantile'. "
+            "'threshold' labels advantage=True when advantage_continuous > "
+            "advantage.positive_threshold; 'quantile' pools advantage_continuous "
+            "across all rollout datasets and labels the top advantage.positive_quantile "
+            "fraction as True."
         )
+    label_mode = str(label_mode).lower()
+    if label_mode not in ("threshold", "quantile"):
+        raise ValueError(
+            "advantage.label_mode must be 'threshold' or 'quantile'; got "
+            f"{label_mode!r}"
+        )
+
+    if label_mode == "threshold":
+        threshold = cfg.advantage.get("positive_threshold")
+        if threshold is None:
+            raise ValueError(
+                "advantage.positive_threshold is required when "
+                "advantage.label_mode='threshold'"
+            )
+        threshold = float(threshold)
+        # ``advantage_continuous`` is a signed bin-weighted expectation in
+        # ``[-1, 1]`` (see module docstring). ``positive_threshold`` is applied
+        # directly on it, so it must live in the same range — NOT in ``[0, 1]``.
+        # Classifier correction can pull values below -1; we still accept the
+        # slightly-below-1 floor so users can set a permissive threshold.
+        if not (-1.0 <= threshold <= 1.0):
+            raise ValueError(
+                f"positive_threshold must be in [-1, 1] (it is a signed-score "
+                f"threshold matching ensemble_signed_score's range); got {threshold}"
+            )
+    else:  # label_mode == "quantile"
+        quantile = cfg.advantage.get("positive_quantile")
+        if quantile is None:
+            raise ValueError(
+                "advantage.positive_quantile is required when "
+                "advantage.label_mode='quantile' (e.g. 0.3 ⇒ top 30% of rollout "
+                "samples by advantage_continuous are labelled True)"
+            )
+        quantile = float(quantile)
+        if not (0.0 < quantile < 1.0):
+            raise ValueError(
+                "positive_quantile must be a fraction in (0, 1) — fraction of "
+                f"top rollout samples labelled True; got {quantile}"
+            )
+
+    classifier_cfg = cfg.advantage.get("classifier")
+    if classifier_cfg is not None:
+        _validate_classifier_cfg(classifier_cfg)
 
     tag = cfg.advantage.get("tag")
     if not tag:
@@ -441,6 +547,48 @@ def _validate_cfg(cfg: DictConfig) -> None:
         ds_path = entry.get("dataset_path")
         if not ds_path or not Path(ds_path).exists():
             raise FileNotFoundError(f"dataset_path does not exist: {ds_path!r}")
+
+
+def _validate_classifier_cfg(classifier_cfg: DictConfig) -> None:
+    """Validate the optional ``advantage.classifier`` sub-config block."""
+    ckpt = classifier_cfg.get("checkpoint")
+    if not ckpt or not Path(ckpt).exists():
+        raise FileNotFoundError(
+            f"advantage.classifier.checkpoint does not exist: {ckpt!r}"
+        )
+    lam = classifier_cfg.get("lambda", 0.0)
+    if lam is None or float(lam) < 0.0:
+        raise ValueError(
+            f"advantage.classifier.lambda must be >= 0, got {lam!r}"
+        )
+    fail_thresh = classifier_cfg.get("fail_threshold")
+    if fail_thresh is None:
+        raise ValueError(
+            "advantage.classifier.fail_threshold is required when classifier "
+            "is enabled"
+        )
+    fail_thresh = float(fail_thresh)
+    # p_fail = sigmoid(logit_fail) is a probability in [0, 1].
+    if not (0.0 <= fail_thresh <= 1.0):
+        raise ValueError(
+            f"advantage.classifier.fail_threshold must be in [0, 1] "
+            f"(it gates P(fail) which is a probability); got {fail_thresh}"
+        )
+    batch_size = classifier_cfg.get("batch_size")
+    if batch_size is not None and int(batch_size) <= 0:
+        raise ValueError(
+            f"advantage.classifier.batch_size must be > 0, got {batch_size}"
+        )
+    num_workers = classifier_cfg.get("num_workers")
+    if num_workers is not None and int(num_workers) < 0:
+        raise ValueError(
+            f"advantage.classifier.num_workers must be >= 0, got {num_workers}"
+        )
+    prefetch = classifier_cfg.get("prefetch_factor")
+    if prefetch is not None and int(prefetch) < 1:
+        raise ValueError(
+            f"advantage.classifier.prefetch_factor must be >= 1, got {prefetch}"
+        )
 
 
 def _move_to_device(obj: Any, device: str):
@@ -545,14 +693,21 @@ def _records_from_predict(
         rows.append({
             "episode_index": int(episodes[i]),
             "frame_index": int(frame_t[i]),
-            "p_progress_aggregated": float(aggregated[i].item()),
+            # ``ensemble_signed_score`` = ``out.predicted_values`` — a
+            # signed bin-weighted expectation in ``[-1, 1]`` (NOT a
+            # probability). Renamed from the historical
+            # ``p_progress_aggregated``, which was misleading because it is
+            # not ``P(progress)`` for num_bins > 2; for num_bins == 2 it
+            # degenerates to ``2 · P(progress) - 1``.
+            "ensemble_signed_score": float(aggregated[i].item()),
             "p_progress_mean": float(mean[i].item()),
             "p_progress_min": float(minv[i].item()),
             "p_progress_variance": float(var[i].item()),
             "member_values": [float(x) for x in members[:, i].tolist()],
             # Multi-bin additive columns. Binary (num_bins=2) still
             # gets these: expected_stride_normalized degenerates to a
-            # monotone function of p_progress, entropy is Bernoulli.
+            # monotone function of ensemble_signed_score, entropy is
+            # Bernoulli.
             "expected_stride_normalized": float(es[i]),
             "entropy_aggregated": float(entropy_agg[i]),
             "entropy_member_mean": float(entropy_member_mean[i]),
@@ -575,15 +730,14 @@ def _build_terminal_frame_rows(
         rows.append({
             "episode_index": int(episode_index),
             "frame_index": int(episode_length) - 1,
-            "p_progress_aggregated": 0.0,
+            "ensemble_signed_score": 0.0,
             "p_progress_mean": 0.0,
             "p_progress_min": 0.0,
             "p_progress_variance": 0.0,
             "member_values": list(zero_members),
-            # Terminal default: assume maximal regressive stride
-            # (E[s]/K = -1) and zero entropy — matches the
-            # "default negative" intent of the existing 0.0
-            # p_progress fill.
+            # Terminal default: assume neutral signed stride (E[s]/K = 0)
+            # and zero entropy — matches the "default neutral" intent of
+            # the 0.0 ensemble_signed_score fill.
             "expected_stride_normalized": 0.0,
             "entropy_aggregated": 0.0,
             "entropy_member_mean": 0.0,
@@ -726,44 +880,356 @@ def _run_inference_for_dataset(
     return df
 
 
-def _finalise_dataframe(
+_CANONICAL_OUTPUT_COLS: list[str] = [
+    "episode_index",
+    "frame_index",
+    "advantage",
+    "advantage_continuous",
+    # ``ensemble_signed_score`` is kept as an explicit column so the
+    # raw ensemble signal is never lost after classifier correction —
+    # recompute / inject / viz all read this when they need the
+    # uncorrected value.
+    "ensemble_signed_score",
+    "p_progress_mean",
+    "p_progress_min",
+    "p_progress_variance",
+    "member_values",
+    "expected_stride_normalized",
+    "entropy_aggregated",
+    "entropy_member_mean",
+    "entropy_member_variance",
+]
+
+
+def _compute_advantage_continuous(
     df: pd.DataFrame,
     *,
-    dataset_type: str,
-    threshold: float,
+    apply_classifier_correction: bool,
+    classifier_lambda: float = 0.0,
+    classifier_fail_threshold: float = 0.0,
 ) -> pd.DataFrame:
-    """Apply threshold, force-True for sft, and project to the final columns."""
+    """Write ``advantage_continuous`` onto a copy of ``df`` — no bool label.
+
+    Kept separate from :func:`_apply_boolean_label` so two-phase main() can
+    compute continuous scores for every dataset first, then decide on a
+    single (possibly quantile-derived) threshold before emitting the bool.
+    """
     if df.empty:
         raise RuntimeError(
             "Empty DataFrame after gather — no predictions were produced for this dataset"
         )
-    df = df.copy()
-    df["advantage_continuous"] = df["p_progress_aggregated"]
-    if dataset_type.lower() == "sft":
-        df["advantage"] = True
+    out = df.copy()
+    if apply_classifier_correction:
+        if "p_fail" not in out.columns:
+            raise ValueError(
+                "_finalise_dataframe(apply_classifier_correction=True) requires "
+                "'p_fail' column in the DataFrame; run classifier inference first."
+            )
+        hinge = (out["p_fail"] - float(classifier_fail_threshold)).clip(lower=0.0)
+        out["advantage_continuous"] = (
+            out["ensemble_signed_score"] - float(classifier_lambda) * hinge
+        )
     else:
-        df["advantage"] = df["advantage_continuous"] > float(threshold)
-    return df[
-        [
-            "episode_index",
-            "frame_index",
-            "advantage",
-            "advantage_continuous",
-            "p_progress_mean",
-            "p_progress_min",
-            "p_progress_variance",
-            "member_values",
-            # Multi-bin additive columns. Always present — binary (num_bins=2)
-            # checkpoints populate them from the 2-wide softmax so downstream
-            # readers can assume a single schema. `advantage_continuous`
-            # intentionally stays tied to ``p_progress_aggregated`` (changing
-            # it would silently shift existing CFG threshold semantics).
-            "expected_stride_normalized",
-            "entropy_aggregated",
-            "entropy_member_mean",
-            "entropy_member_variance",
-        ]
-    ]
+        out["advantage_continuous"] = out["ensemble_signed_score"]
+    return out
+
+
+def _apply_boolean_label(
+    df: pd.DataFrame,
+    *,
+    dataset_type: str,
+    positive_threshold: float,
+) -> pd.DataFrame:
+    """Add the boolean ``advantage`` column and select canonical columns.
+
+    ``dataset_type == "sft"`` forces ``advantage=True``; ``"rollout"`` uses
+    ``advantage_continuous > positive_threshold``. ``positive_threshold`` is
+    the effective threshold — in quantile label_mode this is the
+    cross-dataset percentile; in threshold label_mode it is the user-set
+    ``advantage.positive_threshold``.
+    """
+    if "advantage_continuous" not in df.columns:
+        raise ValueError(
+            "_apply_boolean_label requires 'advantage_continuous' column; run "
+            "_compute_advantage_continuous first."
+        )
+    out = df.copy()
+    if dataset_type.lower() == "sft":
+        out["advantage"] = True
+    else:
+        out["advantage"] = out["advantage_continuous"] > float(positive_threshold)
+
+    out_cols = list(_CANONICAL_OUTPUT_COLS)
+    if "p_fail" in out.columns:
+        out_cols += ["p_fail", "logit_fail"]
+    return out[out_cols]
+
+
+def _finalise_dataframe(
+    df: pd.DataFrame,
+    *,
+    dataset_type: str,
+    positive_threshold: float,
+    apply_classifier_correction: bool,
+    classifier_lambda: float = 0.0,
+    classifier_fail_threshold: float = 0.0,
+) -> pd.DataFrame:
+    """Compute ``advantage_continuous`` and the boolean ``advantage`` label.
+
+    Thin wrapper that composes :func:`_compute_advantage_continuous` and
+    :func:`_apply_boolean_label` — kept as a single-call entry point for
+    backward-compat with unit tests that depend on the combined signature.
+
+    Args:
+        df: per-frame DataFrame carrying ``ensemble_signed_score`` and
+            (if ``apply_classifier_correction`` is ``True``) ``p_fail``.
+        dataset_type: ``"sft"`` forces ``advantage=True`` for every frame;
+            ``"rollout"`` thresholds on ``positive_threshold``.
+        positive_threshold: signed-score threshold in ``[-1, 1]``. The boolean
+            label is ``advantage_continuous > positive_threshold``.
+        apply_classifier_correction: if True, apply the hinge penalty
+            ``λ · max(p_fail - classifier_fail_threshold, 0)`` to
+            ``ensemble_signed_score`` to produce ``advantage_continuous``.
+            Otherwise ``advantage_continuous == ensemble_signed_score``.
+        classifier_lambda: λ weight on the hinge penalty.
+        classifier_fail_threshold: fail-probability hinge knee in ``[0, 1]``.
+
+    Returns:
+        DataFrame with the canonical column order (classifier columns
+        appended when present in ``df``).
+    """
+    df_cont = _compute_advantage_continuous(
+        df,
+        apply_classifier_correction=apply_classifier_correction,
+        classifier_lambda=classifier_lambda,
+        classifier_fail_threshold=classifier_fail_threshold,
+    )
+    return _apply_boolean_label(
+        df_cont,
+        dataset_type=dataset_type,
+        positive_threshold=positive_threshold,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Classifier inference phase (optional)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_classifier_ds_kwargs(
+    *,
+    dataset_entry: DictConfig,
+    cfg: DictConfig,
+    classifier_cfg: DictConfig,
+    classifier_config,
+) -> dict[str, Any]:
+    """Compose FrameClassifierDataset kwargs with first-non-none priority.
+
+    Priority (most → least specific): per-dataset entry > classifier.data
+    override > top-level cfg.data > env fallback. We use ``_first_non_none``
+    instead of ``.get(k, fallback)`` so explicit YAML ``key: null`` still
+    falls through.
+    """
+    clf_data = classifier_cfg.get("data") or {}
+
+    robot_type = _first_non_none(
+        dataset_entry.get("robot_type"),
+        clf_data.get("robot_type"),
+        cfg.data.get("robot_type"),
+    )
+    model_type = _first_non_none(
+        dataset_entry.get("model_type"),
+        clf_data.get("model_type"),
+        cfg.data.get("model_type"),
+    )
+    norm_stats_dir = _first_non_none(
+        dataset_entry.get("norm_stats_dir"),
+        clf_data.get("norm_stats_dir"),
+        cfg.data.get("norm_stats_dir"),
+        os.environ.get("LIBERO_NORM_STATS_DIR"),
+    )
+    asset_id = _first_non_none(
+        dataset_entry.get("asset_id"),
+        clf_data.get("asset_id"),
+        cfg.data.get("asset_id"),
+    )
+    default_prompt = _first_non_none(
+        dataset_entry.get("default_prompt"),
+        dataset_entry.get("prompt"),
+        cfg.data.get("default_prompt"),
+        cfg.data.get("prompt"),
+    )
+    max_state_dim = int(
+        _first_non_none(
+            clf_data.get("max_state_dim"),
+            getattr(classifier_config, "max_state_dim", None),
+            cfg.data.get("max_state_dim"),
+            32,
+        )
+    )
+    action_dim = int(
+        _first_non_none(
+            dataset_entry.get("action_dim"),
+            cfg.data.get("action_dim"),
+            32,
+        )
+    )
+    min_ep_len = int(
+        _first_non_none(
+            clf_data.get("min_episode_length"),
+            dataset_entry.get("min_episode_length"),
+            1,
+        )
+    )
+
+    return {
+        "dataset_path": str(dataset_entry.dataset_path),
+        "dataset_type": str(dataset_entry.type),
+        "camera_keys": tuple(cfg.data.camera_keys),
+        "include_state": bool(getattr(classifier_config, "use_proprio", False)),
+        "state_key": str(cfg.data.get("state_key", "state")),
+        "max_state_dim": max_state_dim,
+        "robot_type": str(robot_type),
+        "model_type": str(model_type),
+        "action_dim": action_dim,
+        "default_prompt": default_prompt,
+        "norm_stats_dir": norm_stats_dir,
+        "asset_id": asset_id,
+        "include_success": True,
+        "include_fail": True,
+        "min_episode_length": min_ep_len,
+        "inference_mode": True,
+    }
+
+
+def _run_classifier_inference_for_dataset(
+    *,
+    classifier,
+    dataset_entry: DictConfig,
+    cfg: DictConfig,
+    classifier_cfg: DictConfig,
+    rank: int,
+    world_size: int,
+    device: str,
+) -> pd.DataFrame:
+    """Run ``classifier.predict`` over every frame of one LeRobot dataset.
+
+    Returns a DataFrame on rank 0 with columns
+    ``[episode_index, frame_index, p_fail, logit_fail]``. Non-rank-0 returns
+    an empty DataFrame (the gather populates rank 0 only). Raises if gather
+    produces duplicate ``(episode, frame)`` keys — that would indicate a
+    broken shard map.
+    """
+    from rlinf.data.datasets.cfg.success_fail_dataset import (
+        FrameClassifierDataset,
+    )
+    from rlinf.models.embodiment.success_fail_classifier import (
+        FrameClassifierDataCollator,
+    )
+
+    ds_kwargs = _resolve_classifier_ds_kwargs(
+        dataset_entry=dataset_entry,
+        cfg=cfg,
+        classifier_cfg=classifier_cfg,
+        classifier_config=classifier.config,
+    )
+    ds = FrameClassifierDataset(**ds_kwargs)
+
+    batch_size = int(
+        _first_non_none(
+            classifier_cfg.get("batch_size"),
+            cfg.advantage.get("batch_size"),
+            256,
+        )
+    )
+    num_workers = int(
+        _first_non_none(
+            classifier_cfg.get("num_workers"),
+            cfg.advantage.get("num_dataloader_workers_per_gpu"),
+            4,
+        )
+    )
+    prefetch = int(
+        _first_non_none(
+            classifier_cfg.get("prefetch_factor"),
+            cfg.advantage.get("prefetch_factor"),
+            2,
+        )
+    )
+
+    start, end = get_shard_indices(len(ds), rank, world_size)
+    shard = Subset(ds, list(range(start, end)))
+
+    collator = FrameClassifierDataCollator(
+        processor=classifier.processor,
+        use_proprio=bool(getattr(classifier.config, "use_proprio", False)),
+    )
+    loader = DataLoader(
+        shard,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        prefetch_factor=prefetch if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
+        pin_memory=True,
+        shuffle=False,
+        collate_fn=collator,
+    )
+
+    if rank == 0:
+        logger.info(
+            "Classifier inference on %s: total_frames=%d, rank0 shard=%d, batch_size=%d",
+            dataset_entry.dataset_path,
+            len(ds),
+            end - start,
+            batch_size,
+        )
+
+    rows: list[dict[str, Any]] = []
+    pbar = tqdm(
+        loader,
+        desc=f"[rank{rank}] classifier {Path(dataset_entry.dataset_path).name}",
+        disable=(rank != 0),
+        total=len(loader),
+    )
+    for batch in pbar:
+        observation = _move_to_device(batch["observation"], device)
+        with torch.inference_mode():
+            out = classifier.predict(observation)
+        logits = out.logits.squeeze(-1).detach().to("cpu", dtype=torch.float32)
+        probs = torch.sigmoid(logits)
+        episodes = batch["episode"].tolist()
+        frame_idx = batch["frame_index"].tolist()
+        for i in range(int(logits.shape[0])):
+            rows.append({
+                "episode_index": int(episodes[i]),
+                "frame_index": int(frame_idx[i]),
+                "p_fail": float(probs[i].item()),
+                "logit_fail": float(logits[i].item()),
+            })
+
+    local_df = pd.DataFrame(rows)
+    if world_size > 1:
+        dist.barrier()
+        df = gather_all_advantages(local_df, rank, world_size)
+    else:
+        df = local_df
+
+    if rank == 0 and len(df) > 0:
+        dup_mask = df.duplicated(
+            subset=["episode_index", "frame_index"], keep=False
+        )
+        n_dup = int(dup_mask.sum())
+        if n_dup:
+            raise RuntimeError(
+                f"classifier inference produced {n_dup} duplicate "
+                "(episode_index, frame_index) keys after gather — shard map "
+                "or FrameClassifierDataset index is broken"
+            )
+        df = (
+            df.sort_values(["episode_index", "frame_index"])
+            .reset_index(drop=True)
+        )
+    return df
 
 
 def _save_advantages_parquet(df: pd.DataFrame, dataset_path: str, tag: str) -> Path:
@@ -785,14 +1251,43 @@ def _update_mixture_config(
     num_bins: int,
     total_samples: int,
     num_positive: int,
+    dataset_type: str,
+    label_mode: str,
+    positive_quantile: Optional[float] = None,
+    classifier_checkpoint: Optional[str] = None,
+    apply_classifier_correction: bool = False,
+    classifier_lambda: Optional[float] = None,
+    classifier_fail_threshold: Optional[float] = None,
 ) -> Path:
-    """Merge a per-tag entry into ``meta/mixture_config.yaml``.
+    """Merge a per-tag entry into ``<dataset>/meta/mixture_config.yaml``.
 
-    Preserves any existing top-level keys and any other tags already
-    recorded under ``tags:``. ``num_bins`` is recorded so that
-    downstream CFG training can detect which classifier produced this
-    parquet without reopening the checkpoint.
+    Writes **only** under ``tags[tag]``; top-level fields (``advantage_tag``,
+    ``datasets``, ``unified_threshold``, ``global_return_min/max``, …) are
+    treated as read-only.
+
+    ``label_mode`` records which rule produced the bool label:
+    ``"threshold"`` (fixed ``positive_threshold``) or ``"quantile"``
+    (cross-rollout top-``positive_quantile`` percentile, with the resulting
+    unified threshold written to ``positive_threshold`` so downstream
+    consumers see a single value).
+
+    Classifier provenance (``classifier_checkpoint / classifier_model_type /
+    classifier_aggregation``) is written whenever a classifier was loaded —
+    independent of whether the correction was applied. The correction
+    parameters (``classifier_lambda / classifier_fail_threshold``) are only
+    written when ``apply_classifier_correction=True``.
+
+    ``has_classifier_correction`` and ``dataset_type`` are recorded so
+    downstream recompute / viz / legacy-guard tooling can read them without
+    re-parsing the parquet schema.
     """
+    if label_mode not in ("threshold", "quantile"):
+        raise ValueError(
+            f"label_mode must be 'threshold' or 'quantile', got {label_mode!r}"
+        )
+    if label_mode == "quantile" and positive_quantile is None:
+        raise ValueError("label_mode='quantile' requires positive_quantile")
+
     meta_dir = Path(dataset_path) / "meta"
     cfg_path = meta_dir / "mixture_config.yaml"
     existing: dict[str, Any] = {}
@@ -810,14 +1305,32 @@ def _update_mixture_config(
         raise RuntimeError(
             f"mixture_config.yaml 'tags' field at {cfg_path} is not a mapping"
         )
-    tags[str(tag)] = {
+    entry: dict[str, Any] = {
         "positive_threshold": float(positive_threshold),
+        "label_mode": str(label_mode),
         "inference_mode": str(inference_mode),
         "ensemble_size": int(ensemble_size),
         "num_bins": int(num_bins),
         "total_samples": int(total_samples),
         "num_positive": int(num_positive),
+        "dataset_type": str(dataset_type),
+        "has_classifier_correction": bool(apply_classifier_correction),
     }
+    if label_mode == "quantile":
+        entry["positive_quantile"] = float(positive_quantile)
+    if classifier_checkpoint is not None:
+        entry["classifier_checkpoint"] = str(classifier_checkpoint)
+        entry["classifier_model_type"] = "success_fail_classifier"
+        entry["classifier_aggregation"] = "sigmoid_of_single_logit"
+    if apply_classifier_correction:
+        if classifier_lambda is None or classifier_fail_threshold is None:
+            raise ValueError(
+                "apply_classifier_correction=True requires classifier_lambda "
+                "and classifier_fail_threshold"
+            )
+        entry["classifier_lambda"] = float(classifier_lambda)
+        entry["classifier_fail_threshold"] = float(classifier_fail_threshold)
+    tags[str(tag)] = entry
     existing["tags"] = tags
     with open(cfg_path, "w") as f:
         yaml.safe_dump(existing, f, sort_keys=False)
@@ -851,7 +1364,16 @@ def main(cfg: DictConfig) -> None:
 
     inference_mode = str(cfg.advantage.model.get("inference_mode", "wco"))
     precision = cfg.advantage.model.get("precision", None)
-    threshold = float(cfg.advantage.positive_threshold)
+    label_mode = str(cfg.advantage.label_mode).lower()
+    # Only one of the two knobs below is read below, but we still coerce
+    # the requested one eagerly so any late YAML typo (e.g. "positive_treshold")
+    # trips here rather than deep inside Phase 2.
+    positive_threshold_cfg: Optional[float] = (
+        float(cfg.advantage.positive_threshold) if label_mode == "threshold" else None
+    )
+    positive_quantile_cfg: Optional[float] = (
+        float(cfg.advantage.positive_quantile) if label_mode == "quantile" else None
+    )
     tag = str(cfg.advantage.tag)
 
     if rank == 0:
@@ -878,7 +1400,81 @@ def main(cfg: DictConfig) -> None:
             bool(getattr(model.config, "include_state_in_prompt", False)),
         )
 
+    # ---- Optional classifier load ----
+    # ``apply_classifier_correction = (classifier is not None)``: if the user
+    # configured a classifier, we always apply correction in this entry point.
+    # Users who want to only inject p_fail / logit_fail without correction
+    # should run the standalone ``inject_classifier_into_advantages.py``.
+    classifier = None
+    classifier_cfg = cfg.advantage.get("classifier")
+    classifier_lambda = 0.0
+    classifier_fail_threshold = 0.0
+    classifier_checkpoint_resolved: Optional[str] = None
+    if classifier_cfg is not None and classifier_cfg.get("checkpoint"):
+        from rlinf.models.embodiment.success_fail_classifier import (
+            SuccessFailClassifier,
+        )
+
+        classifier_checkpoint_resolved = str(classifier_cfg.checkpoint)
+        classifier_lambda = float(_first_non_none(classifier_cfg.get("lambda"), 1.0))
+        classifier_fail_threshold = float(
+            _first_non_none(classifier_cfg.get("fail_threshold"), 0.4)
+        )
+
+        default_prompt = _first_non_none(
+            cfg.data.get("default_prompt"),
+            cfg.data.get("prompt"),
+        )
+        model_overrides = classifier_cfg.get("model") or {}
+        classifier = SuccessFailClassifier.from_checkpoint(
+            classifier_checkpoint_resolved,
+            device=device,
+            env_type=str(cfg.data.robot_type),
+            model_type=str(cfg.data.model_type),
+            default_prompt=default_prompt,
+            vision_repo_id=_first_non_none(model_overrides.get("vision_repo_id")),
+            use_proprio=_first_non_none(model_overrides.get("use_proprio")),
+            proprio_dim=_first_non_none(model_overrides.get("proprio_dim")),
+            image_size=_first_non_none(model_overrides.get("image_size")),
+            label_smoothing=_first_non_none(model_overrides.get("label_smoothing")),
+            precision=_first_non_none(model_overrides.get("precision")),
+            max_state_dim=_first_non_none(model_overrides.get("max_state_dim")),
+            action_dim=int(cfg.data.get("action_dim", 32)),
+        )
+
+        # Align processor image_keys to the ensemble's camera_keys —
+        # otherwise :class:`SuccessFailClassifierImageProcessor` silently
+        # zero-fills any camera not in its image_keys (see processing.py).
+        camera_keys = tuple(cfg.data.camera_keys)
+        if tuple(classifier.processor.image_keys) != camera_keys:
+            if rank == 0:
+                logger.info(
+                    "Overriding classifier.processor.image_keys %s → %s "
+                    "(match ensemble cfg.data.camera_keys)",
+                    classifier.processor.image_keys,
+                    camera_keys,
+                )
+            classifier.processor.image_keys = camera_keys
+
+        if rank == 0:
+            logger.info(
+                "Loaded SuccessFailClassifier from %s (λ=%s, fail_threshold=%s, "
+                "use_proprio=%s)",
+                classifier_checkpoint_resolved,
+                classifier_lambda,
+                classifier_fail_threshold,
+                bool(getattr(classifier.config, "use_proprio", False)),
+            )
+
+    apply_classifier_correction = classifier is not None
+
     try:
+        # ---- Phase 1: GPU inference + advantage_continuous ----
+        # All ranks participate in inference; rank 0 accumulates the per-frame
+        # continuous scores so Phase 2 can pick a unified threshold before
+        # committing bool labels. Other ranks park at the per-dataset barrier
+        # so the GPU memory / NCCL state stays in lockstep with rank 0.
+        collected: list[tuple[Any, pd.DataFrame]] = []
         for ds_idx, entry in enumerate(cfg.data.train_data_paths):
             if rank == 0:
                 logger.info(
@@ -896,39 +1492,144 @@ def main(cfg: DictConfig) -> None:
                 world_size=world_size,
                 device=device,
             )
-            if rank != 0:
-                if world_size > 1:
-                    dist.barrier()
-                continue
 
-            final_df = _finalise_dataframe(
-                df, dataset_type=str(entry.type), threshold=threshold
-            )
-            out_path = _save_advantages_parquet(final_df, entry.dataset_path, tag)
-            num_positive = int(final_df["advantage"].sum())
-            total_samples = int(len(final_df))
-            mix_path = _update_mixture_config(
-                dataset_path=entry.dataset_path,
-                tag=tag,
-                positive_threshold=threshold,
-                inference_mode=str(model.config.inference_mode),
-                ensemble_size=int(model.config.ensemble_size),
-                num_bins=int(getattr(model.config, "num_bins", 2)),
-                total_samples=total_samples,
-                num_positive=num_positive,
-            )
-            logger.info(
-                "Wrote %s (rows=%d, positive=%d/%d, p_mean_avg=%.4f). Updated %s",
-                out_path,
-                total_samples,
-                num_positive,
-                total_samples,
-                float(final_df["p_progress_mean"].mean()),
-                mix_path,
-            )
+            if classifier is not None:
+                clf_df = _run_classifier_inference_for_dataset(
+                    classifier=classifier,
+                    dataset_entry=entry,
+                    cfg=cfg,
+                    classifier_cfg=classifier_cfg,
+                    rank=rank,
+                    world_size=world_size,
+                    device=device,
+                )
+                if rank == 0:
+                    merged = df.merge(
+                        clf_df[
+                            ["episode_index", "frame_index", "p_fail", "logit_fail"]
+                        ],
+                        on=["episode_index", "frame_index"],
+                        how="left",
+                        validate="one_to_one",
+                    )
+                    missing_mask = (
+                        merged[["p_fail", "logit_fail"]].isna().any(axis=1)
+                    )
+                    n_missing = int(missing_mask.sum())
+                    if n_missing:
+                        raise RuntimeError(
+                            f"classifier inference missed {n_missing} rows for "
+                            f"{entry.dataset_path} after left-join on "
+                            "(episode_index, frame_index); shard/dataset "
+                            "coverage is broken"
+                        )
+                    df = merged
+
+            if rank == 0:
+                df_cont = _compute_advantage_continuous(
+                    df,
+                    apply_classifier_correction=apply_classifier_correction,
+                    classifier_lambda=classifier_lambda,
+                    classifier_fail_threshold=classifier_fail_threshold,
+                )
+                collected.append((entry, df_cont))
 
             if world_size > 1:
                 dist.barrier()
+
+        # ---- Phase 2: pick unified threshold + write parquet + update meta ----
+        # Runs only on rank 0. In quantile mode the threshold is the
+        # ``(1 - positive_quantile)``-th percentile of advantage_continuous
+        # pooled across every rollout dataset — sft datasets are ignored when
+        # picking the threshold (they are always labelled True by convention)
+        # but still receive the same unified_threshold in their tag metadata
+        # for provenance.
+        if rank == 0:
+            if label_mode == "quantile":
+                rollout_scores: list[np.ndarray] = [
+                    d["advantage_continuous"].values
+                    for e, d in collected
+                    if str(e.type).lower() == "rollout"
+                ]
+                if not rollout_scores:
+                    raise ValueError(
+                        "advantage.label_mode='quantile' requires at least one "
+                        "rollout dataset to derive the unified threshold; none "
+                        "of the configured train_data_paths has type='rollout'."
+                    )
+                combined = np.concatenate(rollout_scores)
+                unified_threshold = float(
+                    np.percentile(
+                        combined, (1.0 - float(positive_quantile_cfg)) * 100.0
+                    )
+                )
+                logger.info(
+                    "label_mode='quantile' (top %.1f%% of %d rollout samples) → "
+                    "unified_threshold=%.4f (advantage_continuous range "
+                    "[%.4f, %.4f])",
+                    float(positive_quantile_cfg) * 100.0,
+                    len(combined),
+                    unified_threshold,
+                    float(combined.min()),
+                    float(combined.max()),
+                )
+            else:
+                unified_threshold = float(positive_threshold_cfg)
+                logger.info(
+                    "label_mode='threshold'; unified_threshold=%.4f",
+                    unified_threshold,
+                )
+
+            for entry, df_cont in collected:
+                final_df = _apply_boolean_label(
+                    df_cont,
+                    dataset_type=str(entry.type),
+                    positive_threshold=unified_threshold,
+                )
+                out_path = _save_advantages_parquet(
+                    final_df, entry.dataset_path, tag
+                )
+                num_positive = int(final_df["advantage"].sum())
+                total_samples = int(len(final_df))
+                mix_path = _update_mixture_config(
+                    dataset_path=entry.dataset_path,
+                    tag=tag,
+                    positive_threshold=unified_threshold,
+                    inference_mode=str(model.config.inference_mode),
+                    ensemble_size=int(model.config.ensemble_size),
+                    num_bins=int(getattr(model.config, "num_bins", 2)),
+                    total_samples=total_samples,
+                    num_positive=num_positive,
+                    dataset_type=str(entry.type),
+                    label_mode=label_mode,
+                    positive_quantile=(
+                        float(positive_quantile_cfg)
+                        if label_mode == "quantile"
+                        else None
+                    ),
+                    classifier_checkpoint=classifier_checkpoint_resolved,
+                    apply_classifier_correction=apply_classifier_correction,
+                    classifier_lambda=(
+                        classifier_lambda if apply_classifier_correction else None
+                    ),
+                    classifier_fail_threshold=(
+                        classifier_fail_threshold
+                        if apply_classifier_correction
+                        else None
+                    ),
+                )
+                logger.info(
+                    "Wrote %s (rows=%d, positive=%d/%d, raw_score_avg=%.4f, "
+                    "classifier=%s, label_mode=%s). Updated %s",
+                    out_path,
+                    total_samples,
+                    num_positive,
+                    total_samples,
+                    float(final_df["ensemble_signed_score"].mean()),
+                    "on" if apply_classifier_correction else "off",
+                    label_mode,
+                    mix_path,
+                )
     finally:
         cleanup_distributed()
 

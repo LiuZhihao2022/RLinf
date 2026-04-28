@@ -1,0 +1,35 @@
+model_type: "success_fail_classifier"
+
+# Loading dtype = FSDP master parameter dtype. Default fp32 for stability
+# (the classifier is small ~22M params, so fp32 master cost is negligible
+# and it avoids the Adam-second-moment collapse that bf16 master can trigger
+# under FSDP mixed precision).
+precision: fp32
+is_lora: false
+
+# DINOv2-s visual backbone. Either a HuggingFace repo id
+# ("facebook/dinov2-small") or a local snapshot path.
+vision_repo_id: facebook/dinov2-small
+vision_revision: null
+
+# DINOv2 patch14 on 224x224 → 16x16 token grid.
+image_size: 224
+
+# Proprio branch (optional). proprio_dim must match max_state_dim so the
+# PadStatesAndActions-normalized state slots straight into the first MLP.
+use_proprio: true
+proprio_dim: 32
+proprio_hidden: 128
+max_state_dim: 32
+
+# Binary head (outputs 1 raw logit per sample).
+hidden_dim: 256
+dropout: 0.1
+label_smoothing: 0.1
+
+# Runtime
+freeze_vision: false
+use_gradient_checkpointing: false
+
+# Optional: previously trained SuccessFailClassifier checkpoint to resume.
+# model_path: "/path/to/checkpoint"

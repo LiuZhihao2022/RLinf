@@ -15,6 +15,18 @@
 #   bash run_compute_advantages_ensemble.sh
 #   bash run_compute_advantages_ensemble.sh compute_advantages_ensemble_fail150_k8_ensemble4_wco --nproc 8
 #   bash run_compute_advantages_ensemble.sh --nproc 1 advantage.batch_size=16
+#
+#   # Post-hoc classifier workflow (no classifier at compute time):
+#   # Step A — inject p_fail/logit_fail into an existing parquet (GPU):
+#   python examples/process/inject_classifier_into_advantages.py \
+#     --dataset_paths /path/to/ds --dataset_types rollout \
+#     --classifier_checkpoint /path/to/classifier/actor \
+#     --source_tag OLD --new_tag OLD_clf1k \
+#     --camera_keys image wrist_image --model_type pi05 --robot_type libero
+#   # Step B — sweep λ / fail_threshold on top (CPU only):
+#   python examples/process/recompute_advantages_ensemble_with_classifier.py \
+#     --dataset_paths /path/to/ds --source_tag OLD_clf1k --new_tag OLD_clf1k_lam1_t04 \
+#     --classifier_lambda 1.0 --classifier_fail_threshold 0.4
 
 set -e
 
