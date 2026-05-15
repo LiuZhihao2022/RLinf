@@ -79,6 +79,7 @@ Usage:
         advantage.classifier.fail_threshold=0.4
 """
 
+import gc
 import logging
 import os
 import sys
@@ -227,9 +228,40 @@ def setup_distributed(cfg: DictConfig) -> tuple[int, int, str]:
     return 0, 1, "cuda"
 
 
+def _release_cuda_memory_for_exit() -> None:
+    """Best-effort CUDA allocator cleanup before NCCL teardown."""
+    gc.collect()
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:
+        logger.warning("CUDA synchronize failed during cleanup: %s", exc)
+    try:
+        torch.cuda.empty_cache()
+    except Exception as exc:
+        logger.warning("CUDA empty_cache failed during cleanup: %s", exc)
+
+
 def cleanup_distributed() -> None:
-    if dist.is_initialized():
+    if not dist.is_initialized():
+        return
+
+    _release_cuda_memory_for_exit()
+    try:
+        if dist.get_world_size() > 1:
+            dist.barrier()
+    except Exception as exc:
+        logger.warning("Final distributed barrier failed during cleanup: %s", exc)
+
+    _release_cuda_memory_for_exit()
+    try:
         dist.destroy_process_group()
+    except Exception as exc:
+        logger.warning(
+            "Ignoring distributed process-group cleanup failure during process exit: %s",
+            exc,
+        )
 
 
 def get_shard_indices(
@@ -1631,6 +1663,11 @@ def main(cfg: DictConfig) -> None:
                     mix_path,
                 )
     finally:
+        # Drop the large CUDA modules before NCCL teardown; the process is
+        # exiting, but NCCL may still need a little device memory to shut down.
+        model = None
+        raw_model = None
+        classifier = None
         cleanup_distributed()
 
 

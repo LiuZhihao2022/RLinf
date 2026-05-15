@@ -36,8 +36,6 @@ Public API (mirrors value_model.modeling_critic.ValueCriticModel):
     - forward(observation, labels=None) -> CriticOutput
     - predict(observation) -> CriticOutput
     - predict_value(observation) -> Tensor   (sigmoid probability)
-    - infer(obs) -> dict
-    - infer_batch(obs_list, **kwargs) -> list[dict]
     - from_checkpoint(checkpoint_dir, **kwargs) -> BinaryValueCriticModel
     - gradient_checkpointing_enable() / .disable()
     - _no_split_modules / _no_split_names properties
@@ -200,18 +198,15 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
                 submod.gradient_checkpointing_disable()
         logger.info("Disabled gradient checkpointing for BinaryValueCriticModel")
 
-    def attach_runtime_assets(self, processor, input_transform, device) -> None:
+    def attach_runtime_assets(self, processor, device) -> None:
         """Attach inference-time runtime assets to this model instance.
 
-        Called from :meth:`from_checkpoint` to wire up the processor,
-        input transform pipeline, and device target so `infer` /
-        `infer_batch` / `_prepare_observation*` can run end-to-end. The
-        ensemble wrapper overrides this to also push the assets down to
-        every member — same method name, so the factory call site stays
-        polymorphic and never needs ``hasattr(model, "members")``.
+        Called from :meth:`from_checkpoint` to wire up the processor and
+        device target. ReWiND is a pair model whose inference contract is
+        collator-prepared observations, so raw-observation OpenPI transforms
+        are intentionally not attached here.
         """
         self.processor = processor
-        self._input_transform = input_transform
         self._device = device
 
     # ------------------------------------------------------------------
@@ -365,6 +360,14 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
         :func:`~rlinf.data.datasets.cfg.rewind.pair_dataset.bin_centers`.
         """
         num_bins = int(self.config.num_bins)
+        if getattr(self.config, "target_mode", "rewind") == "positive_only":
+            stride_k = int(getattr(self.config, "stride_k"))
+            strides_per_bin = stride_k // num_bins
+            arange = torch.arange(num_bins, device=probs.device, dtype=probs.dtype)
+            centers = 1.0 + arange * float(strides_per_bin)
+            centers = centers + float(strides_per_bin - 1) / 2.0
+            return (probs * centers).sum(dim=-1) / float(stride_k)
+
         half = num_bins // 2
         if half < 1:
             raise ValueError(
@@ -491,6 +494,8 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
         label_smoothing: Optional[float] = None,
         num_frames_per_pair: Optional[int] = None,
         num_bins: Optional[int] = None,
+        target_mode: Optional[str] = None,
+        stride_k: Optional[int] = None,
         ensemble_size: Optional[int] = None,
         inference_mode: Optional[str] = None,
         precision: Optional[str] = None,
@@ -526,13 +531,10 @@ ensemble_modeling_critic.EnsembleBinaryValueCriticModel` wrapper when
         from omegaconf import OmegaConf
         from transformers import AutoTokenizer
 
-        from rlinf.models.embodiment.value_model.checkpoint_utils import (
-            build_input_transforms,
-            load_norm_stats,
-        )
-
         from . import get_model
         from .processing import Pistar06ValueImageProcessor, Pistar06ValueProcessor
+
+        del env_type, model_type, default_prompt, norm_stats, kwargs
 
         checkpoint_dir = pathlib.Path(checkpoint_dir)
         logger.info(f"Loading ARM+ReWiND binary value model from {checkpoint_dir}")
@@ -544,6 +546,8 @@ ensemble_modeling_critic.EnsembleBinaryValueCriticModel` wrapper when
             "label_smoothing": label_smoothing,
             "num_frames_per_pair": num_frames_per_pair,
             "num_bins": num_bins,
+            "target_mode": target_mode,
+            "stride_k": stride_k,
             "ensemble_size": ensemble_size,
             "inference_mode": inference_mode,
             "precision": precision,
@@ -599,6 +603,20 @@ ensemble_modeling_critic.EnsembleBinaryValueCriticModel` wrapper when
                 "  No image processor config found in checkpoint; using defaults"
             )
 
+        member = model.members[0] if hasattr(model, "members") else model
+        backbone = getattr(member, "model")
+        model_image_size = tuple(int(v) for v in backbone.image_resolution)
+        if image_processor is None:
+            image_processor = Pistar06ValueImageProcessor(image_size=model_image_size)
+        elif tuple(image_processor.image_size) != model_image_size:
+            logger.warning(
+                "  Checkpoint image processor size %s does not match vision "
+                "encoder native size %s; preserving the checkpoint processor "
+                "for preprocessing parity",
+                tuple(image_processor.image_size),
+                model_image_size,
+            )
+
         # Read state-in-prompt fields off the just-constructed model.config so
         # inference-time prompt construction matches what the model was trained
         # on. Backward-compat defaults kick in when the checkpoint predates
@@ -616,40 +634,8 @@ ensemble_modeling_critic.EnsembleBinaryValueCriticModel` wrapper when
             ),
         )
 
-        # Norm stats
-        if norm_stats is None:
-            try:
-                norm_stats = load_norm_stats(checkpoint_dir, env_type)
-                logger.info(f"Loaded norm stats with asset_id={env_type}")
-            except FileNotFoundError:
-                logger.warning(
-                    f"Could not find norm stats in {checkpoint_dir}, "
-                    "proceeding without normalization"
-                )
-
-        if norm_stats and "return" in norm_stats:
-            norm_stats = {k: v for k, v in norm_stats.items() if k != "return"}
-
-        use_quantile_norm = model_type.lower() != "pi0"
-
-        transforms = build_input_transforms(
-            env_type=env_type,
-            model_type=model_type,
-            # Binary model has no action branch — pass a default so the
-            # shared openpi transform (PadStatesAndActions) still works.
-            action_dim=kwargs.get("action_dim", 32),
-            default_prompt=default_prompt,
-            norm_stats=norm_stats,
-            use_quantile_norm=use_quantile_norm,
-        )
-
-        from openpi.transforms import compose
-
-        input_transform = compose(transforms)
-
         model.attach_runtime_assets(
             processor=processor,
-            input_transform=input_transform,
             device=device,
         )
 
@@ -664,8 +650,8 @@ ensemble_modeling_critic.EnsembleBinaryValueCriticModel` wrapper when
         """CPU-only observation preparation (safe for DataLoader workers).
 
         Standalone copy of ValueCriticModel._prepare_observation_cpu adapted
-        to use Pistar06ValueProcessor (which outputs [0, 1] BCHW 384x384
-        images instead of [-1, 1] 224x224).
+        to use Pistar06ValueProcessor (which outputs [0, 1] BCHW images at
+        the value model's configured vision resolution).
         """
         import numpy as np
 
@@ -909,22 +895,13 @@ ensemble_modeling_critic.EnsembleBinaryValueCriticModel` wrapper when
 
     @torch.no_grad()
     def infer(self, obs: dict) -> dict:
-        """Infer value from a single raw observation.
-
-        Returns ``{"value": float, "state": np.ndarray}``.
-        """
-        import numpy as np
-
-        inputs = {
-            k: v.copy() if isinstance(v, np.ndarray) else v for k, v in obs.items()
-        }
-        inputs = self._input_transform(inputs)
-        observation = self._prepare_observation(inputs)
-        result = self.predict(observation)
-        return {
-            "value": float(result.predicted_values[0].item()),
-            "state": obs.get("state", np.array([])),
-        }
+        """Raw-observation inference is not supported for this pair model."""
+        del obs
+        raise RuntimeError(
+            "BinaryValueCriticModel is a ReWiND pair model and does not accept "
+            "single-frame raw observations. Use BinaryPairDataCollator to build "
+            "a pair observation, then call predict(observation)."
+        )
 
     @torch.no_grad()
     def infer_batch(
@@ -935,77 +912,13 @@ ensemble_modeling_critic.EnsembleBinaryValueCriticModel` wrapper when
         pretransformed: bool = False,
         already_cpu_prepared: bool = False,
     ) -> list[dict]:
-        """Batched inference. Returns one dict of scalar stats per input.
-
-        Independent copy of ``ValueCriticModel.infer_batch``. Calls
-        ``self.predict(observation)`` which routes through our own
-        forward → ``RewindArmBackbone.forward`` path.
-        """
-        import numpy as np
-
-        if not obs_list:
-            return []
-
-        device = getattr(self, "_device", "cuda")
-        all_outputs = []
-
-        for batch_start in range(0, len(obs_list), batch_size):
-            batch_end = min(batch_start + batch_size, len(obs_list))
-            batch_obs = obs_list[batch_start:batch_end]
-
-            if already_cpu_prepared:
-                first = batch_obs[0]
-                if isinstance(first.get("images"), dict):
-                    batched_images = {
-                        k: torch.cat([obs["images"][k] for obs in batch_obs], dim=0).to(
-                            device
-                        )
-                        for k in first["images"]
-                    }
-                    batched_masks = {
-                        k: torch.cat(
-                            [obs["image_masks"][k] for obs in batch_obs], dim=0
-                        ).to(device)
-                        for k in first["image_masks"]
-                    }
-                else:
-                    batched_images = torch.cat(
-                        [obs["images"] for obs in batch_obs], dim=0
-                    ).to(device)
-                    batched_masks = torch.cat(
-                        [obs["image_masks"] for obs in batch_obs], dim=0
-                    ).to(device)
-
-                observation = {
-                    "images": batched_images,
-                    "image_masks": batched_masks,
-                    "tokenized_prompt": torch.cat(
-                        [obs["tokenized_prompt"] for obs in batch_obs], dim=0
-                    ).to(device),
-                    "tokenized_prompt_mask": torch.cat(
-                        [obs["tokenized_prompt_mask"] for obs in batch_obs], dim=0
-                    ).to(device),
-                }
-            else:
-                inputs_list = []
-                for obs in batch_obs:
-                    inputs = {
-                        k: v.copy() if isinstance(v, np.ndarray) else v
-                        for k, v in obs.items()
-                    }
-                    if not pretransformed:
-                        inputs = self._input_transform(inputs)
-                    inputs_list.append(inputs)
-
-                observation = self._prepare_observation_batch(inputs_list)
-
-            result = self.predict(observation)
-            values = result.predicted_values.cpu()
-
-            for i in range(len(batch_obs)):
-                all_outputs.append({"value": float(values[i])})
-
-        return all_outputs
+        """Raw-observation batched inference is not supported for this pair model."""
+        del obs_list, batch_size, pretransformed, already_cpu_prepared
+        raise RuntimeError(
+            "BinaryValueCriticModel is a ReWiND pair model and does not accept "
+            "raw observation batches. Use BinaryPairDataCollator to build pair "
+            "observations, then call predict(observation)."
+        )
 
 
 __all__ = [

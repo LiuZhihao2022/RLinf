@@ -31,7 +31,7 @@ except ImportError:
     pass
 
 import dataclasses
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 from rlinf.data.datasets.cfg.mixture_datasets import (  # noqa: E402
     CfgMixtureDataset,
@@ -42,10 +42,22 @@ from rlinf.data.datasets.cfg.return_loaders import (  # noqa: E402
     load_return_stats_from_dataset,
     load_returns_sidecar,
 )
-from rlinf.data.datasets.cfg.value_dataset import ValueDataset  # noqa: E402
-from rlinf.data.datasets.cfg.value_transforms import (  # noqa: E402
-    ReturnNormalizer,
-)
+if TYPE_CHECKING:
+    from rlinf.data.datasets.cfg.value_dataset import ValueDataset
+    from rlinf.data.datasets.cfg.value_transforms import ReturnNormalizer
+
+
+def __getattr__(name: str) -> Any:
+    """Lazy-load optional dataset classes with heavyweight dependencies."""
+    if name == "ValueDataset":
+        from rlinf.data.datasets.cfg.value_dataset import ValueDataset
+
+        return ValueDataset
+    if name == "ReturnNormalizer":
+        from rlinf.data.datasets.cfg.value_transforms import ReturnNormalizer
+
+        return ReturnNormalizer
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 class ValueDataLoaderImpl:

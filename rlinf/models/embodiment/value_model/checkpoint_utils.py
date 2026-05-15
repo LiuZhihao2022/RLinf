@@ -27,6 +27,20 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+_X2ROBOT_MODES = ("s2s", "s2m", "sm2m", "sm2sm")
+
+
+def _get_x2robot_mode(env_type: str) -> str | None:
+    """Return the X2Robot mode encoded in an env/config name, if present."""
+    env = env_type.lower()
+    if env in ("x2robot", "arx"):
+        return "sm2sm"
+    for mode in _X2ROBOT_MODES:
+        if env == mode or env.endswith(f"_{mode}"):
+            return mode
+    return None
+
+
 def load_state_dict_from_checkpoint(checkpoint_path: pathlib.Path) -> dict:
     """Load state dict from checkpoint directory or file.
 
@@ -151,7 +165,11 @@ def build_input_transforms(
     import openpi.models.model as _openpi_model
     import openpi.transforms as _openpi_transforms
 
-    from rlinf.models.embodiment.openpi.policies import franka_policy, libero_policy
+    from rlinf.models.embodiment.openpi.policies import (
+        arx_policy,
+        franka_policy,
+        libero_policy,
+    )
 
     _mt_map = {
         "pi0": _openpi_model.ModelType.PI0,
@@ -162,15 +180,28 @@ def build_input_transforms(
 
     input_transforms = []
 
-    if env_type == "libero":
+    env_type_lower = env_type.lower()
+    x2robot_mode = _get_x2robot_mode(env_type_lower)
+
+    if env_type_lower == "libero":
         input_transforms.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
         input_transforms.append(libero_policy.LiberoInputs(model_type=model_type_enum))
 
-    elif env_type in ("franka", "franka_co_train"):
+    elif env_type_lower in ("franka", "franka_co_train"):
         input_transforms.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
         input_transforms.append(
             franka_policy.FrankaEEInputs(
                 action_dim=action_dim, model_type=model_type_enum
+            )
+        )
+
+    elif x2robot_mode is not None:
+        input_transforms.append(_openpi_transforms.InjectDefaultPrompt(default_prompt))
+        input_transforms.append(
+            arx_policy.ArxInputs(
+                mode=x2robot_mode,
+                action_dim=action_dim,
+                model_type=model_type_enum,
             )
         )
 

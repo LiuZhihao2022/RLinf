@@ -44,6 +44,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -53,6 +54,37 @@ import torch
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+
+def _isolate_hf_datasets_cache_for_process() -> None:
+    """Optionally give each actor its own HuggingFace datasets cache directory."""
+    if os.environ.get("RLINF_ISOLATE_HF_DATASETS_CACHE", "0").lower() in (
+        "0",
+        "false",
+        "no",
+    ):
+        return
+
+    if os.environ.get("RLINF_HF_DATASETS_CACHE_ISOLATED"):
+        return
+
+    base_cache = os.environ.get("HF_DATASETS_CACHE")
+    if not base_cache:
+        hf_home = os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+        base_cache = str(Path(hf_home) / "datasets")
+
+    rank = os.environ.get("RANK", "norank")
+    cache_dir = Path(base_cache) / f"rlinf_rank_{rank}_pid_{os.getpid()}"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_DATASETS_CACHE"] = str(cache_dir)
+    os.environ["RLINF_HF_DATASETS_CACHE_ISOLATED"] = "1"
+
+    try:
+        import datasets
+
+        datasets.config.HF_DATASETS_CACHE = str(cache_dir)
+    except ImportError:
+        pass
 
 
 # Camera-view aliases tried against raw LeRobot sample dicts. Callers pass
@@ -163,6 +195,21 @@ def _signed_stride_to_bin(stride: int, K: int, num_bins: int) -> int:
     return int((pos * num_bins) // (2 * K))
 
 
+def _positive_stride_to_bin(stride: int, K: int, num_bins: int) -> int:
+    """Map a positive stride in ``{1,...,K}`` to a positive-only bin index."""
+    if stride < 1 or stride > K:
+        raise ValueError(
+            f"_positive_stride_to_bin requires 1 <= stride <= K, "
+            f"got stride={stride}, K={K}."
+        )
+    if num_bins < 1 or num_bins > K or K % num_bins != 0:
+        raise ValueError(
+            f"positive-only bins require 1 <= num_bins <= K and K % num_bins == 0; "
+            f"got K={K}, num_bins={num_bins}."
+        )
+    return int(((stride - 1) * num_bins) // K)
+
+
 def bin_centers(K: int, num_bins: int) -> np.ndarray:
     """Return the ``[num_bins]`` signed-stride centers for the bin layout.
 
@@ -203,6 +250,22 @@ def bin_centers(K: int, num_bins: int) -> np.ndarray:
             low = -K + b * strides_per_bin
         else:
             low = 1 + (b - half) * strides_per_bin
+        high = low + strides_per_bin - 1
+        centers[b] = (low + high) / 2.0
+    return centers
+
+
+def positive_bin_centers(K: int, num_bins: int) -> np.ndarray:
+    """Return ``[num_bins]`` positive-stride centers for positive-only mode."""
+    if num_bins < 1 or num_bins > K or K % num_bins != 0:
+        raise ValueError(
+            f"positive_bin_centers requires 1 <= num_bins <= K and "
+            f"K % num_bins == 0; got K={K}, num_bins={num_bins}."
+        )
+    strides_per_bin = K // num_bins
+    centers = np.empty(num_bins, dtype=np.float32)
+    for b in range(num_bins):
+        low = 1 + b * strides_per_bin
         high = low + strides_per_bin - 1
         centers[b] = (low + high) / 2.0
     return centers
@@ -283,6 +346,7 @@ class _LeRobotSource(TrajectorySource):
         only_success: bool = True,
         dataset_type: str,
     ) -> None:
+        _isolate_hf_datasets_cache_for_process()
         try:
             from lerobot.common.datasets.lerobot_dataset import (  # noqa: E501
                 LeRobotDataset,
@@ -487,6 +551,10 @@ class PairDataset(Dataset):
             column marks the episode as successful. For LeRobot datasets
             this checks one representative frame row per episode rather
             than relying on episode-level metadata files.
+        open_rewind: Whether to emit negative rewound pairs. When ``False``,
+            the dataset becomes positive-only: each temporal anchor appears
+            once and labels discretize positive strides ``1..k`` into
+            ``num_bins`` bins.
         min_episode_length: Optional override for the minimum-length
             floor (default ``k + 1``).
     """
@@ -506,6 +574,7 @@ class PairDataset(Dataset):
         state_key: str = "state",
         dataset_type: Optional[str] = None,
         only_success: Optional[bool] = None,
+        open_rewind: bool = True,
         min_episode_length: Optional[int] = None,
         num_bins: int = 2,
     ) -> None:
@@ -515,6 +584,7 @@ class PairDataset(Dataset):
         self.k = int(k)
         if self.k < 1:
             raise ValueError(f"k must be >= 1, got {self.k}")
+        self.open_rewind = bool(open_rewind)
         # Mode switch. num_bins == 2 → legacy binary mode: fixed-stride k.
         # num_bins > 2 → multi-bin: sample i uniformly from [1, min(K, T-1-t)]
         # per-anchor at __getitem__ time. Both emit a long bin-index label
@@ -524,12 +594,23 @@ class PairDataset(Dataset):
         # 1 = progress. 2K must be an integer multiple of num_bins so every
         # bin covers the same number of strides (uniform bin widths).
         self.num_bins = int(num_bins)
-        if self.num_bins < 2 or self.num_bins % 2 != 0:
+        if self.open_rewind and (self.num_bins < 2 or self.num_bins % 2 != 0):
             raise ValueError(f"num_bins must be >= 2 and even, got {self.num_bins}")
-        if self.num_bins > 2 and (2 * self.k) % self.num_bins != 0:
+        if (
+            self.open_rewind
+            and self.num_bins > 2
+            and (2 * self.k) % self.num_bins != 0
+        ):
             raise ValueError(
                 f"For num_bins={self.num_bins} in multi-bin mode, 2*k must be a "
                 f"multiple of num_bins; got k={self.k} (2*k={2 * self.k})."
+            )
+        if not self.open_rewind and (
+            self.num_bins < 1 or self.num_bins > self.k or self.k % self.num_bins != 0
+        ):
+            raise ValueError(
+                f"Positive-only mode requires 1 <= num_bins <= k and "
+                f"k % num_bins == 0; got k={self.k}, num_bins={self.num_bins}."
             )
         self.include_state = bool(include_state)
         self.state_max_dim = state_max_dim
@@ -602,17 +683,20 @@ class PairDataset(Dataset):
         logger.info(
             "PairDataset: dataset_path=%s, episodes=%d eligible=%d, k=%d, "
             "num_bins=%d (%s mode), total_positions=%d, include_state=%s, "
-            "dataset_type=%s, only_success=%s, camera_keys=%s",
+            "dataset_type=%s, only_success=%s, open_rewind=%s, camera_keys=%s",
             self.source_name,
             total_eps,
             len(self._eligible),
             self.k,
             self.num_bins,
-            "binary" if self.num_bins == 2 else "multi-bin",
+            "binary"
+            if self.open_rewind and self.num_bins == 2
+            else ("multi-bin" if self.open_rewind else "positive-only"),
             self._num_pair_positions,
             self.include_state,
             self.dataset_type,
             self.only_success,
+            self.open_rewind,
             self.camera_keys,
         )
 
@@ -633,6 +717,8 @@ class PairDataset(Dataset):
         return self._num_pair_positions
 
     def __len__(self) -> int:
+        if not self.open_rewind:
+            return self._num_pair_positions
         # Each temporal anchor contributes two labeled samples:
         #   positive: (t, t+k)
         #   negative: (t+k, t)
@@ -644,6 +730,9 @@ class PairDataset(Dataset):
             idx += len(self)
         if not (0 <= idx < len(self)):
             raise IndexError(idx)
+
+        if not self.open_rewind:
+            return idx, True
 
         pair_position = idx // 2
         is_positive = (idx % 2) == 0
@@ -734,7 +823,7 @@ class PairDataset(Dataset):
         episode, t, t_plus_k_binary = self._resolve_pair_position(pair_position)
         prompt = self._resolve_prompt(episode, t)
 
-        if self.num_bins == 2:
+        if self.open_rewind and self.num_bins == 2:
             # Binary path: fixed stride k with the existing boundary
             # clamp (t+k may degrade to T-1 near episode end). Labels are
             # long bin indices matching the multi-bin layout — 1 for
@@ -772,7 +861,10 @@ class PairDataset(Dataset):
             else:
                 frame_idx_t, frame_idx_tk = t + i, t
                 signed_stride = -i
-            label = _signed_stride_to_bin(signed_stride, self.k, self.num_bins)
+            if self.open_rewind:
+                label = _signed_stride_to_bin(signed_stride, self.k, self.num_bins)
+            else:
+                label = _positive_stride_to_bin(i, self.k, self.num_bins)
 
         return self._build_sample(
             episode=episode,
@@ -966,14 +1058,16 @@ ValueDataCollator`. Runs the evorl :class:`Pistar06ValueProcessor` **twice**
         if any_state:
             template = next((s for s in states_list if s is not None), None)
             state_dim = int(template.shape[0])
-            state_batch = np.stack([
-                (
-                    np.asarray(s, dtype=np.float32).reshape(-1)
-                    if s is not None
-                    else np.zeros(state_dim, dtype=np.float32)
-                )
-                for s in states_list
-            ])
+            state_batch = np.stack(
+                [
+                    (
+                        np.asarray(s, dtype=np.float32).reshape(-1)
+                        if s is not None
+                        else np.zeros(state_dim, dtype=np.float32)
+                    )
+                    for s in states_list
+                ]
+            )
 
         processed_txt = self.processor.process_text(
             prompts=prompts,
@@ -993,9 +1087,7 @@ ValueDataCollator`. Runs the evorl :class:`Pistar06ValueProcessor` **twice**
         # (num_bins == 2) uses 0 = regress, 1 = progress; multi-bin uses
         # the _signed_stride_to_bin layout. Both feed straight into
         # ``F.cross_entropy`` with no further remapping.
-        labels = torch.tensor(
-            [int(ex["label"]) for ex in examples], dtype=torch.long
-        )
+        labels = torch.tensor([int(ex["label"]) for ex in examples], dtype=torch.long)
         return {
             "observation": observation,
             "labels": labels,
@@ -1015,4 +1107,5 @@ __all__ = [
     "BinaryPairDataCollator",
     "PairDataset",
     "TrajectorySource",
+    "positive_bin_centers",
 ]

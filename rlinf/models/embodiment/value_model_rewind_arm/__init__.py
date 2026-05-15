@@ -50,6 +50,8 @@ _BINARY_VALUE_CONFIG_DEFAULTS: dict[str, Any] = {
     "label_smoothing": 0.05,
     "num_frames_per_pair": 2,
     "num_bins": 2,
+    "target_mode": "rewind",
+    "stride_k": None,
     "ensemble_size": 1,
     "inference_mode": "mo",
     "uwo_lambda": 1.0,

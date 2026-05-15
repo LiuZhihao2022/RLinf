@@ -18,7 +18,7 @@ Standalone module — does NOT import anything from
 ``rlinf.models.embodiment.value_model.processing``.
 
 Key differences from the value_model processor:
-    * Native 384x384 image resolution (not 224x224 + interpolate)
+    * Native vision-encoder image resolution (not fixed 224x224 + interpolate)
     * Outputs raw [0, 1] BCHW float images (not [-1, 1])
       so the downstream Pistar06Model can apply its own SigLIP-style
       mean/std normalization in ``_preprocess_images``.
@@ -28,7 +28,7 @@ import logging
 import os
 import string
 from collections.abc import Sequence
-from typing import ClassVar, Optional, Union
+from typing import Any, ClassVar, Optional, Union
 
 import numpy as np
 import torch
@@ -129,8 +129,37 @@ IMAGE_KEYS = (
     "right_wrist_0_rgb",
 )
 
-# Native Pistar06 vision-encoder resolution (siglip-so400m-patch14-384).
+# Default Pistar06 vision-encoder resolution (siglip-so400m-patch14-384).
 IMAGE_RESOLUTION = (384, 384)
+
+
+def resolve_image_size(image_processor: Any) -> tuple[int, int]:
+    """Resolve ``(height, width)`` from a HuggingFace image processor."""
+    size = getattr(image_processor, "size", None)
+    if isinstance(size, dict):
+        if "height" in size and "width" in size:
+            return int(size["height"]), int(size["width"])
+        if "shortest_edge" in size:
+            edge = int(size["shortest_edge"])
+            return edge, edge
+    if isinstance(size, int):
+        return int(size), int(size)
+    return IMAGE_RESOLUTION
+
+
+def resolve_vision_image_size(
+    vision_repo_id: str,
+    revision: Optional[str] = None,
+) -> tuple[int, int]:
+    """Load a vision processor and return its native image size."""
+    from transformers import AutoImageProcessor
+
+    image_processor = AutoImageProcessor.from_pretrained(
+        vision_repo_id,
+        revision=revision,
+        use_fast=True,
+    )
+    return resolve_image_size(image_processor)
 
 
 def normalize_image_to_pistar06_format(
@@ -175,9 +204,9 @@ def normalize_image_to_pistar06_format(
 class Pistar06ValueImageProcessor(ImageProcessingMixin):
     """Pistar06 image processor.
 
-    Resizes raw multi-camera input to native 384x384, outputs BCHW [0, 1]
-    float tensors. The downstream Pistar06Model handles SigLIP normalization
-    internally.
+    Resizes raw multi-camera input to the configured native resolution and
+    outputs BCHW [0, 1] float tensors. The downstream Pistar06Model handles
+    SigLIP normalization internally.
     """
 
     model_input_names: ClassVar[list[str]] = ["pixel_values", "image_masks"]
@@ -275,7 +304,7 @@ class Pistar06ValueImageProcessor(ImageProcessingMixin):
         image_masks_dict: Optional[dict[str, torch.Tensor]] = None,
         train: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """Process a batch of images at native 384x384 resolution.
+        """Process a batch of images at the configured native resolution.
 
         Output:
             (processed_images_dict, processed_masks_dict)
@@ -685,6 +714,8 @@ __all__ = [
     "Pistar06ValueImageProcessor",
     "Pistar06ValueProcessor",
     "normalize_image_to_pistar06_format",
+    "resolve_image_size",
+    "resolve_vision_image_size",
     "resize_with_pad",
     "IMAGE_KEYS",
     "IMAGE_RESOLUTION",

@@ -200,22 +200,18 @@ class EnsembleBinaryValueCriticModel(nn.Module):
         for member in self.members:
             member.gradient_checkpointing_disable()
 
-    def attach_runtime_assets(self, processor, input_transform, device) -> None:
+    def attach_runtime_assets(self, processor, device) -> None:
         """Attach inference-time runtime assets to self AND every member.
 
         Overrides :meth:`BinaryValueCriticModel.attach_runtime_assets`:
-        the ensemble's own ``infer`` / ``infer_batch`` reads
-        ``self._input_transform`` directly, while the per-member
-        ``_prepare_observation*`` delegations in this class call into
-        ``members[0]``. Both surfaces must see the same assets, so we
-        push them down to every member rather than duck-typing from the
-        outside.
+        the per-member ``_prepare_observation*`` delegations in this class
+        call into ``members[0]``. Every member needs the same processor and
+        device target for collator-prepared pair observations.
         """
         self.processor = processor
-        self._input_transform = input_transform
         self._device = device
         for member in self.members:
-            member.attach_runtime_assets(processor, input_transform, device)
+            member.attach_runtime_assets(processor, device)
 
     @staticmethod
     def _gather_member_batch_values(
@@ -398,24 +394,12 @@ class EnsembleBinaryValueCriticModel(nn.Module):
 
     @torch.no_grad()
     def infer(self, obs: dict) -> dict:
-        import numpy as np
-
-        inputs = {
-            key: value.copy() if isinstance(value, np.ndarray) else value
-            for key, value in obs.items()
-        }
-        inputs = self._input_transform(inputs)
-        observation = self._prepare_observation(inputs)
-        result = self.predict(observation)
-
-        return {
-            "value": float(result.predicted_values[0].item()),
-            "member_values": result.member_predicted_values[:, 0].tolist(),
-            "value_mean": float(result.prediction_mean[0].item()),
-            "value_min": float(result.prediction_min[0].item()),
-            "value_variance": float(result.prediction_variance[0].item()),
-            "state": obs.get("state", np.array([])),
-        }
+        del obs
+        raise RuntimeError(
+            "EnsembleBinaryValueCriticModel is a ReWiND pair model and does "
+            "not accept single-frame raw observations. Use BinaryPairDataCollator "
+            "to build a pair observation, then call predict(observation)."
+        )
 
     @torch.no_grad()
     def infer_batch(
@@ -426,81 +410,12 @@ class EnsembleBinaryValueCriticModel(nn.Module):
         pretransformed: bool = False,
         already_cpu_prepared: bool = False,
     ) -> list[dict]:
-        import numpy as np
-
-        if not obs_list:
-            return []
-
-        device = getattr(self, "_device", "cuda")
-        all_outputs = []
-
-        for batch_start in range(0, len(obs_list), batch_size):
-            batch_end = min(batch_start + batch_size, len(obs_list))
-            batch_obs = obs_list[batch_start:batch_end]
-
-            if already_cpu_prepared:
-                first = batch_obs[0]
-                if isinstance(first.get("images"), dict):
-                    batched_images = {
-                        key: torch.cat(
-                            [obs["images"][key] for obs in batch_obs], dim=0
-                        ).to(device)
-                        for key in first["images"]
-                    }
-                    batched_masks = {
-                        key: torch.cat(
-                            [obs["image_masks"][key] for obs in batch_obs], dim=0
-                        ).to(device)
-                        for key in first["image_masks"]
-                    }
-                else:
-                    batched_images = torch.cat(
-                        [obs["images"] for obs in batch_obs], dim=0
-                    ).to(device)
-                    batched_masks = torch.cat(
-                        [obs["image_masks"] for obs in batch_obs], dim=0
-                    ).to(device)
-
-                observation = {
-                    "images": batched_images,
-                    "image_masks": batched_masks,
-                    "tokenized_prompt": torch.cat(
-                        [obs["tokenized_prompt"] for obs in batch_obs], dim=0
-                    ).to(device),
-                    "tokenized_prompt_mask": torch.cat(
-                        [obs["tokenized_prompt_mask"] for obs in batch_obs], dim=0
-                    ).to(device),
-                }
-            else:
-                inputs_list = []
-                for obs in batch_obs:
-                    inputs = {
-                        key: value.copy() if isinstance(value, np.ndarray) else value
-                        for key, value in obs.items()
-                    }
-                    if not pretransformed:
-                        inputs = self._input_transform(inputs)
-                    inputs_list.append(inputs)
-
-                observation = self._prepare_observation_batch(inputs_list)
-
-            result = self.predict(observation)
-            values = result.predicted_values.cpu()
-            member_values = result.member_predicted_values.cpu()
-            value_mean = result.prediction_mean.cpu()
-            value_min = result.prediction_min.cpu()
-            value_variance = result.prediction_variance.cpu()
-
-            for idx in range(len(batch_obs)):
-                all_outputs.append({
-                    "value": float(values[idx].item()),
-                    "member_values": member_values[:, idx].tolist(),
-                    "value_mean": float(value_mean[idx].item()),
-                    "value_min": float(value_min[idx].item()),
-                    "value_variance": float(value_variance[idx].item()),
-                })
-
-        return all_outputs
+        del obs_list, batch_size, pretransformed, already_cpu_prepared
+        raise RuntimeError(
+            "EnsembleBinaryValueCriticModel is a ReWiND pair model and does "
+            "not accept raw observation batches. Use BinaryPairDataCollator "
+            "to build pair observations, then call predict(observation)."
+        )
 
     @classmethod
     def from_checkpoint(cls, *args, **kwargs):

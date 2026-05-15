@@ -896,6 +896,15 @@ def validate_sft_cfg(cfg: DictConfig) -> DictConfig:
     )
 
     with open_dict(cfg):
+        if cfg.data.get("awbc", None) is None:
+            cfg.data.awbc = {"enabled": False}
+        if cfg.data.awbc.get("enabled", False):
+            assert cfg.actor.model.get("model_type", None) == "openpi", (
+                "data.awbc.enabled is only supported for actor.model.model_type='openpi'"
+            )
+            assert cfg.data.get("advantage_tag", None) is not None, (
+                "data.advantage_tag is required when data.awbc.enabled=True"
+            )
         if cfg.data.get("train_data_paths", None) is None:
             # if train_data_paths is None, the code will just eval the model
             assert cfg.data.get("eval_data_paths", None) is not None, (

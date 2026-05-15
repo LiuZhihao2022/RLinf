@@ -51,7 +51,6 @@ from torch.utils.data import Dataset
 
 from rlinf.data.datasets.cfg.rewind.pair_dataset import (
     _IMAGE_KEY_ALIASES,
-    _STATE_KEY_ALIASES,
     _resolve_alias,
     _to_float32_1d,
     _to_uint8_hwc,
@@ -279,9 +278,7 @@ class FrameClassifierDataset(Dataset):
             for key in list(batch.keys()):
                 vals = batch[key]
                 if vals and isinstance(vals[0], dict) and "bytes" in vals[0]:
-                    batch[key] = [
-                        PILImage.open(io.BytesIO(v["bytes"])) for v in vals
-                    ]
+                    batch[key] = [PILImage.open(io.BytesIO(v["bytes"])) for v in vals]
             return hf_transform_to_torch(batch)
 
         self.base.hf_dataset.set_transform(_decoding_transform)
@@ -336,9 +333,7 @@ class FrameClassifierDataset(Dataset):
                     if not line:
                         continue
                     d = json.loads(line)
-                    tasks[int(d.get("task_index", len(tasks)))] = str(
-                        d.get("task", "")
-                    )
+                    tasks[int(d.get("task_index", len(tasks)))] = str(d.get("task", ""))
             return tasks
         parquet = meta / "tasks.parquet"
         if parquet.exists():
@@ -394,6 +389,7 @@ class FrameClassifierDataset(Dataset):
         import openpi.transforms as _openpi_transforms
 
         from rlinf.models.embodiment.openpi.policies import (
+            arx_policy,
             franka_policy,
             libero_policy,
         )
@@ -408,9 +404,15 @@ class FrameClassifierDataset(Dataset):
 
         # Repack mapping mirrors ValueDataset's _REPACK_KEYS for the same
         # robots — see value_dataset.py:45-73 for the full table.
-        from rlinf.data.datasets.cfg.value_dataset import _REPACK_KEYS
+        from rlinf.data.datasets.cfg.value_dataset import (
+            _REPACK_KEYS,
+            _get_x2robot_mode,
+        )
 
+        x2robot_mode = _get_x2robot_mode(robot)
         repack_keys = _REPACK_KEYS.get(robot)
+        if repack_keys is None and x2robot_mode is not None:
+            repack_keys = _REPACK_KEYS["fold_towel_sm2sm"]
         if repack_keys is None:
             raise ValueError(
                 f"Unknown robot type: {robot_type}. "
@@ -423,6 +425,14 @@ class FrameClassifierDataset(Dataset):
         elif robot in ("franka", "franka_co_train"):
             steps.append(
                 franka_policy.FrankaEEInputs(
+                    action_dim=action_dim,
+                    model_type=model_type_enum,
+                )
+            )
+        elif x2robot_mode is not None:
+            steps.append(
+                arx_policy.ArxInputs(
+                    mode=x2robot_mode,
                     action_dim=action_dim,
                     model_type=model_type_enum,
                 )
@@ -448,9 +458,7 @@ class FrameClassifierDataset(Dataset):
                     "drop norm_stats_dir from the config to disable quantile "
                     "normalization (only safe when use_proprio=False)."
                 ) from exc
-            steps.append(
-                _openpi_transforms.Normalize(norm_stats, use_quantiles=True)
-            )
+            steps.append(_openpi_transforms.Normalize(norm_stats, use_quantiles=True))
 
         steps.append(_openpi_transforms.PadStatesAndActions(action_dim))
         return _openpi_transforms.compose(steps)
@@ -547,9 +555,7 @@ class FrameClassifierDataset(Dataset):
                 state_np = state.detach().cpu().numpy()
             else:
                 state_np = np.asarray(state)
-            sample["state"] = _to_float32_1d(
-                state_np, max_dim=self.max_state_dim
-            )
+            sample["state"] = _to_float32_1d(state_np, max_dim=self.max_state_dim)
         return sample
 
 

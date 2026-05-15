@@ -102,13 +102,16 @@ class FSDPCfgWorker(FSDPSftWorker):
     def build_dataloader(self):
         """Build CFG dataloader with advantage-weighted sampling across datasets."""
         import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+        import openpi.shared.download as download
         import openpi.training.data_loader as openpi_data_loader
         import openpi.transforms as transforms
+        from openpi.training import checkpoints as _checkpoints
 
         from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
 
         data_cfg = self.cfg.get("data", {})
         openpi_cfg = self.cfg.actor.model.openpi
+        data_kwargs = getattr(self.cfg.actor.model, "openpi_data", None)
         advantage_tag = data_cfg.get("advantage_tag", None)
 
         datasets_config = data_cfg.get("train_data_paths", [])
@@ -121,14 +124,49 @@ class FSDPCfgWorker(FSDPSftWorker):
         first_path = datasets_config[0]["dataset_path"]
         config = get_openpi_config(
             openpi_cfg.config_name,
-            model_path=self.cfg.actor.model.model_path,
             batch_size=self.cfg.actor.micro_batch_size * self._world_size,
             repo_id=first_path,
+            asset_id=openpi_cfg.get("asset_id", None),
+            data_kwargs=data_kwargs,
         )
         data_config = config.data.create(config.assets_dirs, config.model)
 
         model_transforms = self._build_model_transforms(data_config)
-        norm_stats = data_config.norm_stats or {}
+        norm_stats = data_config.norm_stats
+        if norm_stats is None and data_config.asset_id is not None:
+            checkpoint_dir = download.maybe_download(
+                str(self.cfg.actor.model.model_path)
+            )
+            norm_stats = _checkpoints.load_norm_stats(
+                checkpoint_dir,
+                data_config.asset_id,
+            )
+        norm_stats = norm_stats or {}
+        state_history_size = getattr(
+            data_config,
+            "state_history_size",
+            getattr(config.data, "state_history_size", 0),
+        )
+        state_future_size = getattr(
+            data_config,
+            "state_future_size",
+            getattr(config.data, "state_future_size", 0),
+        )
+        state_step = getattr(
+            data_config, "state_step", getattr(config.data, "state_step", 1)
+        )
+
+        def build_delta_timestamps(fps: float) -> dict[str, list[float]]:
+            delta_timestamps = {
+                key: [t / fps for t in range(config.model.action_horizon)]
+                for key in data_config.action_sequence_keys
+            }
+            if state_history_size > 0 or state_future_size > 0:
+                delta_timestamps["state"] = [
+                    t * state_step / fps
+                    for t in range(-state_history_size, state_future_size + 1)
+                ]
+            return delta_timestamps
 
         datasets_with_weights = []
         for ds_config in datasets_config:
@@ -141,12 +179,7 @@ class FSDPCfgWorker(FSDPSftWorker):
             base_dataset = lerobot_dataset.LeRobotDataset(
                 data_path,
                 episodes=episodes,
-                delta_timestamps={
-                    key: [
-                        t / dataset_meta.fps for t in range(config.model.action_horizon)
-                    ]
-                    for key in data_config.action_sequence_keys
-                },
+                delta_timestamps=build_delta_timestamps(dataset_meta.fps),
             )
 
             base_dataset.hf_dataset = cast_image_features(base_dataset.hf_dataset)
@@ -315,20 +348,23 @@ class FSDPCfgWorker(FSDPSftWorker):
                 )
 
                 try:
-                    observation, actions, advantage = next(self.data_iter)
+                    batch = next(self.data_iter)
                 except StopIteration:
                     self._data_epoch = getattr(self, "_data_epoch", 0) + 1
                     self._current_epoch = self._data_epoch
                     self._data_iter_offset = 0
                     self.data_loader.set_epoch(self._data_epoch)
                     self.data_iter = iter(self.data_loader)
-                    observation, actions, advantage = next(self.data_iter)
+                    batch = next(self.data_iter)
                 self._data_iter_offset += 1
+                observation, actions, advantage = batch
 
                 observation = jax.tree.map(
-                    lambda x: torch.as_tensor(x)
-                    .contiguous()
-                    .to(self.device, non_blocking=True),
+                    lambda x: (
+                        torch.as_tensor(x)
+                        .contiguous()
+                        .to(self.device, non_blocking=True)
+                    ),
                     observation,
                 )
                 actions = actions.to(torch.float32).to(self.device, non_blocking=True)
@@ -380,7 +416,6 @@ class FSDPCfgWorker(FSDPSftWorker):
                     "grad_norm": grad_norm_value,
                 },
             )
-
             self.lr_scheduler.step()
 
             count_keys = {

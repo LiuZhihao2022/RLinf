@@ -132,6 +132,7 @@ def save_state_dict_sharded_safetensors(
         for idx, (keys, _) in enumerate(shards_plan):
             shard_idx = idx + 1
             shard_dict = {}
+            shard_storage_keys = set()
 
             # (CPU transfer happens here)
             for k in keys:
@@ -141,6 +142,16 @@ def save_state_dict_sharded_safetensors(
                     t = t.cpu()
                 if not t.is_contiguous():
                     t = t.contiguous()
+                storage_key = (
+                    t.untyped_storage().data_ptr(),
+                    t.storage_offset(),
+                    tuple(t.shape),
+                    tuple(t.stride()),
+                )
+                if storage_key in shard_storage_keys:
+                    t = t.clone()
+                else:
+                    shard_storage_keys.add(storage_key)
                 shard_dict[k] = t
 
             fname = f"{base_name}-{shard_idx:05d}-of-{num_shards:05d}.safetensors"

@@ -24,12 +24,19 @@ import numpy as np
 import openpi.models.model as _openpi_model
 import openpi.transforms as _openpi_transforms
 import torch
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+from lerobot.common.datasets.lerobot_dataset import (
+    LeRobotDataset,
+    LeRobotDatasetMetadata,
+)
 from lerobot.common.datasets.utils import hf_transform_to_torch
 from PIL import Image as PILImage
 from torch.utils.data import Dataset
 
-from rlinf.models.embodiment.openpi.policies import franka_policy, libero_policy
+from rlinf.models.embodiment.openpi.policies import (
+    arx_policy,
+    franka_policy,
+    libero_policy,
+)
 
 from .return_loaders import load_returns_sidecar
 from .value_transforms import ReturnNormalizer
@@ -70,7 +77,31 @@ _REPACK_KEYS = {
         "actions": "actions",
         "prompt": "prompt",
     },
+    "fold_towel_sm2sm": {
+        "images": {
+            "left_wrist_view": "left_wrist_view",
+            "face_view": "face_view",
+            "right_wrist_view": "right_wrist_view",
+        },
+        "state": "state",
+        "actions": "actions",
+        "prompt": "task",
+    },
 }
+
+
+_X2ROBOT_MODES = ("s2s", "s2m", "sm2m", "sm2sm")
+
+
+def _get_x2robot_mode(robot_type: str) -> str | None:
+    """Return the X2Robot mode encoded in a robot/config name, if present."""
+    robot = robot_type.lower()
+    if robot in ("x2robot", "arx"):
+        return "sm2sm"
+    for mode in _X2ROBOT_MODES:
+        if robot == mode or robot.endswith(f"_{mode}"):
+            return mode
+    return None
 
 
 def _hf_transform_decode_images(batch: dict) -> dict:
@@ -262,9 +293,12 @@ class ValueDataset(Dataset):
         robot = robot_type.lower()
 
         transforms_list = []
+        x2robot_mode = _get_x2robot_mode(robot)
 
         # 1. Repack (map dataset keys → standard observation keys)
         repack_keys = _REPACK_KEYS.get(robot)
+        if repack_keys is None and x2robot_mode is not None:
+            repack_keys = _REPACK_KEYS["fold_towel_sm2sm"]
         if repack_keys is None:
             raise ValueError(
                 f"Unknown robot type: {robot_type}. "
@@ -280,6 +314,14 @@ class ValueDataset(Dataset):
         elif robot in ("franka", "franka_co_train"):
             transforms_list.append(
                 franka_policy.FrankaEEInputs(
+                    action_dim=action_dim,
+                    model_type=model_type_enum,
+                )
+            )
+        elif x2robot_mode is not None:
+            transforms_list.append(
+                arx_policy.ArxInputs(
+                    mode=x2robot_mode,
                     action_dim=action_dim,
                     model_type=model_type_enum,
                 )

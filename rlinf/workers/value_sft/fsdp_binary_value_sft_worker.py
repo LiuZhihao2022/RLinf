@@ -142,6 +142,18 @@ def _ensure_binary_value_precision_cfg(model_cfg: DictConfig) -> str:
     return str(model_cfg.precision)
 
 
+def _normalize_target_mode(mode: Any) -> str:
+    mode_norm = str(mode).strip().lower()
+    if mode_norm in ("positive-only", "positive", "norewind", "no_rewind"):
+        mode_norm = "positive_only"
+    if mode_norm not in ("rewind", "positive_only"):
+        raise ValueError(
+            "actor.model.target_mode must be 'rewind' or 'positive_only', "
+            f"got {mode!r}."
+        )
+    return mode_norm
+
+
 def _collect_non_finite_tensor_paths(value: Any, prefix: str) -> list[str]:
     """Return dotted tensor paths whose values contain NaN/Inf."""
     if isinstance(value, torch.Tensor):
@@ -243,7 +255,9 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             has_tokenizer_files,
         )
         from rlinf.models.embodiment.value_model_rewind_arm.processing import (
+            Pistar06ValueImageProcessor,
             Pistar06ValueProcessor,
+            resolve_vision_image_size,
         )
 
         data_cfg = self.cfg.get("data", {})
@@ -272,11 +286,25 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                 ),
             )
         )
-        processor = Pistar06ValueProcessor(
-            tokenizer_name_or_path=tokenizer_path,
-            max_token_len=int(getattr(model_cfg, "max_token_len", 200)),
+        image_size = resolve_vision_image_size(
+            getattr(model_cfg, "vision_repo_id"),
+            revision=getattr(model_cfg, "vision_revision", None),
+        )
+        image_processor = Pistar06ValueImageProcessor(
+            image_size=image_size,
             image_keys=camera_keys_tuple,
             do_augment=bool(data_cfg.get("do_augment", True)),
+        )
+        logger.info(
+            "Binary value image processor uses %sx%s for vision_repo_id=%s",
+            image_size[0],
+            image_size[1],
+            getattr(model_cfg, "vision_repo_id"),
+        )
+        processor = Pistar06ValueProcessor(
+            image_processor=image_processor,
+            tokenizer_name_or_path=tokenizer_path,
+            max_token_len=int(getattr(model_cfg, "max_token_len", 200)),
             include_state_in_prompt=bool(
                 getattr(model_cfg, "include_state_in_prompt", True)
             ),
@@ -292,11 +320,25 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
         # keeps the head / loss / metrics contract consistent.
         num_bins = int(getattr(model_cfg, "num_bins", 2))
         k = int(data_cfg.get("k", 4))
-        if num_bins > 2 and (2 * k) % num_bins != 0:
+        target_mode = _normalize_target_mode(
+            getattr(model_cfg, "target_mode", "rewind")
+        )
+        with open_dict(model_cfg):
+            model_cfg.target_mode = target_mode
+            model_cfg.stride_k = k
+        if target_mode == "rewind" and num_bins > 2 and (2 * k) % num_bins != 0:
             raise ValueError(
                 "Binary value multi-bin mode requires 2*data.k to be a "
                 f"multiple of model.num_bins; got data.k={k}, "
                 f"model.num_bins={num_bins} (2*k={2 * k})."
+            )
+        if target_mode == "positive_only" and (
+            num_bins > k or k % num_bins != 0
+        ):
+            raise ValueError(
+                "Binary value positive-only mode requires "
+                "1 <= model.num_bins <= data.k and data.k % model.num_bins == 0; "
+                f"got data.k={k}, model.num_bins={num_bins}."
             )
         train_collator = BinaryPairDataCollator(
             processor=processor,
@@ -362,6 +404,25 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                     "Binary value PairDataset requires an explicit data.only_success "
                     f"or train_data_paths[*].only_success for dataset_path={ds_path!r}."
                 )
+            default_open_rewind = target_mode != "positive_only"
+            if "open_rewind" in entry:
+                open_rewind = entry["open_rewind"]
+            else:
+                open_rewind = data_cfg.get("open_rewind", default_open_rewind)
+            open_rewind = bool(open_rewind)
+            if target_mode == "positive_only" and open_rewind:
+                raise ValueError(
+                    "actor.model.target_mode=positive_only requires "
+                    "data.open_rewind=false or train_data_paths[*].open_rewind=false "
+                    f"for dataset_path={ds_path!r}."
+                )
+            if target_mode == "rewind" and not open_rewind:
+                raise ValueError(
+                    "data.open_rewind=false with actor.model.target_mode=rewind "
+                    "would train only the positive half of a signed ReWiND head. "
+                    "Set actor.model.target_mode=positive_only and reduce "
+                    "actor.model.num_bins to the positive-bin count."
+                )
             return PairDataset(
                 dataset_path=ds_path,
                 camera_keys=tuple(
@@ -382,6 +443,7 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
                 state_key=str(data_cfg.get("state_key", "state")),
                 dataset_type=dataset_type,
                 only_success=only_success,
+                open_rewind=open_rewind,
                 min_episode_length=data_cfg.get("min_episode_length", None),
                 num_bins=num_bins,
             )
@@ -579,8 +641,73 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
         this degenerates to ``labels == 1``.
         """
         num_bins = int(getattr(self.cfg.actor.model, "num_bins", 2))
+        if getattr(self.cfg.actor.model, "target_mode", "rewind") == "positive_only":
+            return 1.0
         positive_mask = labels >= (num_bins // 2)
         return float(positive_mask.to(dtype=torch.float32).mean().item())
+
+    def _log_training_batch_diagnostics_once(
+        self,
+        observation: dict[str, Any],
+        labels: torch.Tensor,
+        result,
+    ) -> None:
+        """Log one rank-0 batch snapshot to catch empty inputs or bad labels."""
+        if getattr(self, "_logged_binary_value_batch_diagnostics", False):
+            return
+        self._logged_binary_value_batch_diagnostics = True
+        if int(getattr(self, "_rank", 0)) != 0:
+            return
+
+        num_bins = int(getattr(self.cfg.actor.model, "num_bins", 2))
+        label_hist = torch.bincount(
+            labels.detach().to(dtype=torch.long).cpu(),
+            minlength=num_bins,
+        ).tolist()
+
+        image_stats = {}
+        for camera_key, images in observation.get("images", {}).items():
+            images_f = images.detach().float()
+            masks = observation.get("image_masks", {}).get(camera_key)
+            image_stats[camera_key] = {
+                "shape": tuple(int(dim) for dim in images.shape),
+                "mean": round(float(images_f.mean().item()), 6),
+                "std": round(float(images_f.std(unbiased=False).item()), 6),
+                "min": round(float(images_f.min().item()), 6),
+                "max": round(float(images_f.max().item()), 6),
+                "mask_frac": round(float(masks.float().mean().item()), 6)
+                if isinstance(masks, torch.Tensor)
+                else None,
+            }
+
+        token_mask = observation.get("tokenized_prompt_mask")
+        token_mask_frac = (
+            round(float(token_mask.float().mean().item()), 6)
+            if isinstance(token_mask, torch.Tensor)
+            else None
+        )
+        logits = getattr(result, "logits", None)
+        hidden_states = getattr(result, "hidden_states", None)
+        logger.warning(
+            "[BinaryValueSFT][BATCH_DIAG] target_mode=%s num_bins=%d "
+            "label_min=%d label_max=%d label_hist=%s image_stats=%s "
+            "token_mask_frac=%s logits_std=%s hidden_std=%s",
+            getattr(self.cfg.actor.model, "target_mode", "rewind"),
+            num_bins,
+            int(labels.min().item()),
+            int(labels.max().item()),
+            label_hist,
+            image_stats,
+            token_mask_frac,
+            round(float(logits.detach().float().std(unbiased=False).item()), 6)
+            if isinstance(logits, torch.Tensor)
+            else None,
+            round(
+                float(hidden_states.detach().float().std(unbiased=False).item()), 6
+            )
+            if isinstance(hidden_states, torch.Tensor)
+            else None,
+        )
 
     def _fetch_next_batch(self) -> dict:
         """Return the next training micro-batch; rotate epoch on exhaustion."""
@@ -635,6 +762,7 @@ class FSDPBinaryValueSftWorker(FSDPModelManager, Worker):
             micro_batch_idx=micro_idx,
             grad_accum=grad_accum,
         )
+        self._log_training_batch_diagnostics_once(observation, labels, result)
 
         # signed_progress_std is intentionally not logged on the training path:
         # in the ensemble flow each member trains on its own shuffled micro

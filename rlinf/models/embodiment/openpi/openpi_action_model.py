@@ -21,14 +21,20 @@ from typing import Any, Literal
 import jax
 import numpy as np
 import torch
+import torch.nn.functional as F
 from openpi import transforms as _transforms
 from openpi.models import model as _model
 from openpi.models.pi0_config import Pi0Config
-from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
+from openpi.models_pytorch.pi0_pytorch import (
+    PI0Pytorch,
+    create_sinusoidal_pos_embedding,
+    make_att_2d_masks,
+)
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.openpi.awbc import compute_advantage_weighted_loss
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 
@@ -235,6 +241,92 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def set_global_step(self, global_step):
         self.global_step = global_step
 
+    def embed_suffix(self, state, noisy_actions, timestep):
+        """Embed state/action suffix tokens, including state sequences."""
+        embs = []
+        pad_masks = []
+        att_masks = []
+
+        if not self.pi05:
+            if self.state_proj.weight.dtype == torch.float32:
+                state = state.to(torch.float32)
+
+            def state_proj_func(state):
+                return self.state_proj(state)
+
+            state_emb = self._apply_checkpoint(state_proj_func, state)
+            if state_emb.ndim == 2:
+                state_emb = state_emb[:, None, :]
+            elif state_emb.ndim != 3:
+                raise ValueError(
+                    "OpenPI expects state with shape [B, D] or [B, S, D], "
+                    f"got {tuple(state.shape)}."
+                )
+
+            embs.append(state_emb)
+            bsize, state_tokens = state_emb.shape[:2]
+            device = state_emb.device
+
+            state_mask = torch.ones(
+                bsize, state_tokens, dtype=torch.bool, device=device
+            )
+            pad_masks.append(state_mask)
+            att_masks += [1] + ([0] * (state_tokens - 1))
+
+        time_emb = create_sinusoidal_pos_embedding(
+            timestep,
+            self.action_in_proj.out_features,
+            min_period=4e-3,
+            max_period=4.0,
+            device=timestep.device,
+        )
+        time_emb = time_emb.type(dtype=timestep.dtype)
+
+        def action_proj_func(noisy_actions):
+            return self.action_in_proj(noisy_actions)
+
+        action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
+
+        if not self.pi05:
+            time_emb = time_emb[:, None, :].expand_as(action_emb)
+            action_time_emb = torch.cat([action_emb, time_emb], dim=2)
+
+            def mlp_func(action_time_emb):
+                x = self.action_time_mlp_in(action_time_emb)
+                x = F.silu(x)
+                return self.action_time_mlp_out(x)
+
+            action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
+            adarms_cond = None
+        else:
+
+            def time_mlp_func(time_emb):
+                x = self.time_mlp_in(time_emb)
+                x = F.silu(x)
+                x = self.time_mlp_out(x)
+                return F.silu(x)
+
+            time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
+            action_time_emb = action_emb
+            adarms_cond = time_emb
+
+        embs.append(action_time_emb)
+
+        bsize, action_time_dim = action_time_emb.shape[:2]
+        action_time_mask = torch.ones(
+            bsize, action_time_dim, dtype=torch.bool, device=timestep.device
+        )
+        pad_masks.append(action_time_mask)
+
+        att_masks += [1] + ([0] * (self.config.action_horizon - 1))
+
+        embs = torch.cat(embs, dim=1)
+        pad_masks = torch.cat(pad_masks, dim=1)
+        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+
+        return embs, pad_masks, att_masks, adarms_cond
+
     def setup_wrappers(
         self,
         transforms: Sequence[_transforms.DataTransformFn] = (),
@@ -316,11 +408,106 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         else:
             raise NotImplementedError
 
+    def _compute_sft_flow_losses(
+        self,
+        observation: _model.Observation,
+        actions: torch.Tensor,
+        *,
+        time: torch.Tensor | None = None,
+        noise: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute OpenPI flow-matching loss and per-sample MSE for SFT."""
+        device = actions.device
+        (
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+        ) = self._preprocess_observation(observation, train=True)
+
+        images = [img.to(device) for img in images]
+        img_masks = [img_mask.to(device) for img_mask in img_masks]
+        state = state.to(device)
+        actions = actions.to(device, dtype=torch.float32)
+
+        if time is None:
+            time = self.sample_time(actions.shape[0], device)
+        if noise is None:
+            noise = self.sample_noise(actions.shape, device)
+        noise = noise.to(device)
+
+        time_expanded = time[:, None, None]
+        x_t = time_expanded * noise + (1 - time_expanded) * actions
+        u_t = noise - actions
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
+            self.embed_suffix(state, x_t, time)
+        )
+        if (
+            self.paligemma_with_expert.paligemma.language_model.layers[
+                0
+            ].self_attn.q_proj.weight.dtype
+            == torch.bfloat16
+        ):
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+
+        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+
+        def forward_func(
+            prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        ):
+            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+                attention_mask=att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+            return suffix_out
+
+        suffix_out = self._apply_checkpoint(
+            forward_func,
+            prefix_embs,
+            suffix_embs,
+            att_2d_masks_4d,
+            position_ids,
+            adarms_cond,
+        )
+        suffix_out = suffix_out[:, -self.config.action_horizon :]
+        suffix_out = suffix_out.to(dtype=torch.float32)
+
+        def action_out_proj_func(suffix_out):
+            return self.action_out_proj(suffix_out)
+
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        per_element_loss = F.mse_loss(u_t, v_t, reduction="none")
+        per_sample_loss = per_element_loss.mean(dim=(-1, -2))
+        flow_loss = per_sample_loss.mean()
+        return flow_loss, per_sample_loss
+
     def sft_forward(self, data, **kwargs):
         if hasattr(self, "gradient_checkpointing_disable"):
             self.gradient_checkpointing_disable()
         observation = data["observation"]
         actions = data["actions"]
+        advantage_weight = data.get("advantage_weight")
+        if advantage_weight is not None:
+            _, per_sample_loss = self._compute_sft_flow_losses(
+                observation,
+                actions,
+                time=kwargs.get("time"),
+                noise=kwargs.get("noise"),
+            )
+            return compute_advantage_weighted_loss(per_sample_loss, advantage_weight)
         return super().forward(observation, actions)
 
     def prepare_dagger_sft_batch(self, batch):
