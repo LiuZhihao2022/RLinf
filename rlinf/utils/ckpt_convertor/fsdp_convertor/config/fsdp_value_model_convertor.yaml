@@ -21,6 +21,9 @@ model:
   # ----- Critic architecture (must match training config) -----
   critic_expert_variant: "gemma_100m"
 
+  siglip_path: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/siglip2-so400m-patch14-224"
+  gemma3_path: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/gemma-3-270m"
+
   # Value head config (must match training)
   num_bins: 201
   v_min: -1.0

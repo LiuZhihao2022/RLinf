@@ -1,0 +1,43 @@
+defaults:
+  - model/pi0@model
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/embodiment/config
+
+convertor:
+  save_path: /path/to/save
+  merge_lora_weighs: false
+  force_cpu: true
+  # ckpt_path: /path/to/full_weights.pt
+  ckpt_path: /home/guqiuyi/workspace/RLinf_qiuyi/logs/20260516-10:22:31/pi0_sft_fold_towel_gqy031703180420_sm2sm/checkpoints/global_step_30000/actor/model_state_dict/full_weights.pt
+
+model:
+  precision: null
+  model_path: "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base_pytorch"
+  model_type: "openpi"
+  num_action_chunks: 20
+  action_dim: 28
+  num_steps: 10
+  add_value_head: false
+  is_lora: false
+  openpi:
+    # config_name: "fold_towel_sm2sm"
+    # asset_id: "fold_towel_tele_0317_0318_0420"
+    config_name: "checkout_chips_sm2sm"
+    # asset_id: "fold_towel_gqy_0317,fold_towel_gqy_0318,fold_towel_gqy_0410,fold_towel_gqy_0420"
+    action_chunk: 20
+    action_env_dim: 28
+    num_steps: 10
+    add_value_head: false
+    train_expert_only: false
+  openpi_data:
+    state_history_size: 3
+    state_future_size: 2
+    state_step: 1
+    repo_id: "checkout_chips_gqy_0312,checkout_chips_gqy_0313"

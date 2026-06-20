@@ -13,7 +13,9 @@ defaults:
   - model/value@advantage.model
 
 advantage:
-  value_checkpoint: /path/to/value_checkpoint
+  # value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/value_sft/x2robot_sft_value_fold_towel-20260520-20:54:17/value_sft/checkpoints/global_step_3000/actor/model_state_dict
+  # value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/value_sft/x2robot_sft_value_checkout_chips-20260606-17:34:22/value_sft/checkpoints/global_step_3000/actor/model_state_dict
+  value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/value_sft/x2robot_sft_value-20260614-17:36:51/value_sft/checkpoints/global_step_3000/actor/model_state_dict
   device: "cuda"
   batch_size: 1024
   flush_interval: 256
@@ -47,20 +49,34 @@ advantage:
 
   model:
     critic_expert_variant: "gemma_1m"
-    tokenizer_path: /path/to/gemma-3-270m
-    siglip_path: /path/to/siglip2-so400m-patch14-224
-    gemma3_path: /path/to/gemma-3-270m
+    tokenizer_path: /mnt/public/guqiuyi/RLinf_active/pretrained_models/gemma-3-270m
+    siglip_path: /mnt/public/guqiuyi/RLinf_active/pretrained_models/siglip2-so400m-patch14-224
+    gemma3_path: /mnt/public/guqiuyi/RLinf_active/pretrained_models/gemma-3-270m
 
 data:
-  model_type: "pi05"
+  model_type: "pi0"
   # Options: "libero", "franka"
-  robot_type: "libero"
+  robot_type: "x2robot"
 
   train_data_paths:
-    - dataset_path: "/path/to/sft_dataset"
-      robot_type: "libero"
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_sft
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_sft
+      robot_type: "x2robot"   # 原来是 "libero"
       type: "sft"
       weight: 1.0
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_rollout
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_rollout
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_rollout
+      robot_type: "x2robot"   # 加上 rollout 数据集
+      type: "rollout"
+      weight: 1.0
+
+  # train_data_paths:
+  #   - dataset_path: "/path/to/sft_dataset"
+  #     robot_type: "libero"
+  #     type: "sft"
+  #     weight: 1.0
 
     # Uncomment to add rollout datasets:
     # - dataset_path: "/path/to/rollout_dataset"

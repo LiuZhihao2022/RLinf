@@ -1,0 +1,109 @@
+defaults:
+  - model/pi0@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 2 # 1 node
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "cfg_sft"
+    logger_backends: ["wandb"]
+
+  max_epochs: 30000
+  max_steps: -1
+  val_check_interval: -1
+  save_interval: 3000
+
+data:
+  num_workers: 8
+  # Tag: loads meta/advantages_{tag}.parquet from each dataset
+  # If null, loads meta/advantages.parquet (legacy format)
+  advantage_tag: null
+
+  # Balance sampling weights by dataset length
+  balance_dataset_weights: true
+
+  seed: 42
+
+  train_data_paths:
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_sft
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_sft
+      type: "sft"
+      weight: 1.0
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_rollout
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_rollout
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_rollout
+      type: "rollout"
+      weight: 1.0
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16 # 8卡用32，16卡用16
+  global_batch_size: 256
+  seed: 0
+
+  model:
+    precision: null
+    model_path: "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base_pytorch"
+    model_type: "cfg_model"
+    add_value_head: False
+    action_dim: 28            # x2robot action dim（默认是 7）
+    num_action_chunks: 20     # 匹配 fold_towel_sm2sm 的 action_horizon=20（默认是 10）
+    openpi:
+      # config_name: "fold_towel_sm2sm"
+      # config_name: "checkout_chips_sm2sm"
+      config_name: "restock_cola_sm2sm"
+      # asset_id: "checkout_chips_recap" 
+      asset_id: "restock_cola_recap"
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: False
+      guidance_type: "positive"
+      positive_only_conditional: true
+
+  optim:
+    lr: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 5000
+    total_training_steps: 30000
+    min_lr: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

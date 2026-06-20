@@ -214,6 +214,13 @@ KEY_MAPPINGS = {
         "observation.gripper_position": "observation/gripper_position",
         "task": "prompt",
     },
+    "x2robot": {
+        "face_view": "images/face_view",
+        "left_wrist_view": "images/left_wrist_view",
+        "right_wrist_view": "images/right_wrist_view",
+        "state": "state",
+        "task": "prompt",
+    },
 }
 
 
@@ -513,7 +520,11 @@ def build_obs(
                 )
         elif src_key in sample:
             val = to_numpy(sample[src_key])
-            obs[dst_key] = val
+            if "/" in dst_key:
+                parts = dst_key.split("/", 1)
+                obs.setdefault(parts[0], {})[parts[1]] = val
+            else:
+                obs[dst_key] = val
 
     return obs
 

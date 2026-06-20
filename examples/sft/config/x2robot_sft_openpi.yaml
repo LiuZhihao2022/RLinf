@@ -1,0 +1,97 @@
+defaults:
+  - model/pi0@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 0-7
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    # experiment_name: "pi0_sft_fold_towel_gqy031703180420_sm2sm"
+    experiment_name: "pi0_sft_checkout_chips_gqy03120313_sm2sm"
+    logger_backends: ["wandb"] # wandb, swanlab
+
+  max_epochs: 30000
+  max_steps: -1
+  val_check_interval: -1
+  save_interval: 5000
+
+data:
+  train_data_paths: "/mnt/public/guqiuyi/huggingface/lerobot"
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32
+  global_batch_size: 256
+  seed: 42
+
+  # Override the default values in model/pi0
+  model:
+    precision: null
+    model_path: "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base_pytorch"
+    num_action_chunks: 20 # interface for the env
+    add_value_head: False
+    openpi:
+      # config_name: "fold_towel_sm2sm"
+      config_name: "checkout_chips_sm2sm"
+      asset_id: "checkout_chips_sft" # 实际没用
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: False
+      guidance_type: "positive"
+      positive_only_conditional: true
+      detach_critic_input: True
+
+  # Override repo_id to train on multiple datasets (comma-separated).
+  # After running calculate_norm_stats.py with the same repo_id, copy the
+  # resulting norm_stats directory into model_path/.
+  openpi_data:
+    # repo_id: "fold_towel_gqy_0317,fold_towel_gqy_0318,fold_towel_gqy_0410,fold_towel_gqy_0420"
+    repo_id: "checkout_chips_gqy_0312,checkout_chips_gqy_0313"
+
+  optim:
+    lr: 5e-5
+    value_lr: 2.5e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    total_training_steps: 30000
+    lr_warmup_steps: 1000
+    min_lr: 0
+
+  # Override the default values in training_backend/fsdp
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: False # for openpi, gradient checkpointing is not supported, please do not change this value
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

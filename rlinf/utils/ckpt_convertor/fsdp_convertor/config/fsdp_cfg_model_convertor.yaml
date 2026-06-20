@@ -1,0 +1,37 @@
+defaults:
+  - model/pi0@model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/embodiment/config
+
+convertor:
+  save_path: /path/to/save
+  merge_lora_weighs: False
+  ckpt_path: /path/to/full_weights.pt
+
+model:
+  model_type: "cfg_model"
+  model_path: "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base_pytorch"
+  add_value_head: False
+  action_dim: 28
+  num_action_chunks: 20
+  is_lora: False
+  openpi:
+    # config_name: "checkout_chips_sm2sm"
+    # asset_id: "checkout_chips_recap"
+    config_name: "restock_cola_sm2sm"
+    asset_id: "restock_cola_recap"
+    action_chunk: 20          # = 训练的 num_action_chunks
+    num_steps: 4              # pi0.yaml 默认 num_steps=4（训练未覆盖）
+    action_env_dim: 28        # = 训练的 action_dim
+    add_value_head: False     # <-- 补这一行，覆盖掉 ${actor.model.add_value_head} 插值
+    cfgrl_guidance_scale: 1.0
+    unconditional_prob: 0.1
+    train_expert_only: False
+    guidance_type: "positive"
+    positive_only_conditional: true

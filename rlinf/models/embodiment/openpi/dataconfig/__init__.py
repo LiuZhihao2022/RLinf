@@ -354,6 +354,45 @@ _CONFIGS = [
         exp_name="fold_towel_gqy031703180410_cjx0415_hyj0415_pys0415_pi0base_sm2sm_h3f2_a20_dm10dh50df50po20",
     ),
     TrainConfig(
+        name="checkout_chips_sm2sm",
+        model=pi0_config.Pi0Config(action_horizon=20),
+        data=LeRobotX2robotDataConfig(
+            repo_id="checkout_chips_gqy_recap_sft,checkout_chips_gqy_recap_rollout", # RECAP
+            mode="sm2sm",
+            state_history_size=3,
+            state_future_size=2,
+            # only_right_obs=True,
+            action_dim=28,
+            random_drop_master=0.10,
+            random_drop_history=0.50,
+            random_drop_future=0.50,
+            random_pos_offset=0.020,
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base/params"),
+        batch_size=128,
+        # exp_name="checkout_chips_gqy_031203130605_sm2sm_h3f2_a20_dm10dh50df50po20", # DAgger
+        exp_name="checkout_chips_gqy_recap_sm2sm_h3f2_a20_dm10dh50df50po20", # RECAP
+    ),
+    TrainConfig(
+        name="restock_cola_sm2sm",
+        model=pi0_config.Pi0Config(action_horizon=20),
+        data=LeRobotX2robotDataConfig(
+            repo_id="restock_cola_gqy_recap_sft,restock_cola_gqy_recap_rollout", # RECAP
+            mode="sm2sm",
+            state_history_size=3,
+            state_future_size=2,
+            # only_right_obs=True,
+            action_dim=28,
+            random_drop_master=0.10,
+            random_drop_history=0.50,
+            random_drop_future=0.50,
+            random_pos_offset=0.020,
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base/params"),
+        batch_size=128,
+        exp_name="restock_cola_gqy_recap_sm2sm_h3f2_a20_dm10dh50df50po20", # RECAP
+    ),
+    TrainConfig(
         name="fold_towel_sm2sm_mixsft",
         model=pi0_config.Pi0Config(action_horizon=20),
         data=LeRobotX2robotDataConfig(
