@@ -12,6 +12,7 @@ build
 docs/build
 dist
 logs/*
+pretrained_models/*
 outputs/*
 *.so
 .venv

@@ -32,9 +32,6 @@ from rlinf.models.embodiment.openpi.dataconfig.behavior_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.calvin_dataconfig import (
     LeRobotCalvinDataConfig,
 )
-from rlinf.models.embodiment.openpi.dataconfig.dual_franka_tcp_rot6d_dataconfig import (
-    DualFrankaTcpRot6dDataConfig,
-)
 from rlinf.models.embodiment.openpi.dataconfig.franka_co_training_dataconfig import (
     LeRobotFrankaEEDataConfig,
 )
@@ -56,17 +53,14 @@ from rlinf.models.embodiment.openpi.dataconfig.maniskill_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.metaworld_dataconfig import (
     LeRobotMetaworldDataConfig,
 )
-from rlinf.models.embodiment.openpi.dataconfig.polaris_dataconfig import (
-    LeRobotPolarisDroidDataConfig,
-)
-from rlinf.models.embodiment.openpi.dataconfig.realworld_dataconfig import (
-    LeRobotRealworldDataConfig,
-)
 from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
     LeRobotRobocasaDataConfig,
 )
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
+)
+from rlinf.models.embodiment.openpi.dataconfig.X2robot_dataconfig import (
+    LeRobotX2robotDataConfig,
 )
 
 _CONFIGS = [
@@ -151,39 +145,13 @@ _CONFIGS = [
         save_interval=250,
     ),
     TrainConfig(
-        name="pi05_franka",
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=8, discrete_state_input=False
-        ),  # discrete_state_input=False: stateless policy, True: with state policy
-        data=LeRobotFrankaEEDataConfig(
-            repo_id="physical-intelligence/real_rl",  # Not important
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(
-                assets_dir="checkpoints/torch/pi05_franka_pretrained/assets"
-            ),
-            output_action_dim=6,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "checkpoints/jax/pi05_base"
-        ),
-        pytorch_weight_path="checkpoints/torch/pi05_base",
-        seed=0,
-        batch_size=16,
-        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
-        num_workers=8,
-        num_train_steps=5_000,
-        log_interval=5,
-        save_interval=250,
-    ),
-    TrainConfig(
         name="pi05_maniskill_sim_real_co_training",
         model=pi0_config.Pi0Config(
             pi05=True, action_horizon=8, discrete_state_input=False
         ),  # discrete_state_input=False: stateless policy, True: with state policy
         data=LeRobotFrankaEEDataConfig(
             repo_id="physical-intelligence/pick_and_place_real",
-            default_prompt="default prompt",
+            default_prompt="defalut prompt",
             base_config=DataConfig(prompt_from_task=True),
             assets=AssetsConfig(
                 assets_dir="checkpoints/torch/pi05_maniskill_sim_real_co_training/assets"
@@ -329,24 +297,6 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
-        name="pi05_behavior",
-        model=pi0_config.Pi0Config(pi05=True, action_horizon=32),
-        data=LeRobotBehaviorDataConfig(
-            repo_id="physical-intelligence/behavior",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(assets_dir="checkpoints/torch/pi05_behavior/assets"),
-            extra_delta_transform=False,
-            extract_state_from_proprio=True,
-            use_all_wrist_images=True,
-            use_quantile_norm=True,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "checkpoints/jax/pi0_base/params"
-        ),
-        pytorch_weight_path="checkpoints/torch/pi0_base",
-        num_train_steps=30_000,
-    ),
-    TrainConfig(
         name="pi05_gsenv",
         model=pi0_config.Pi0Config(
             pi05=True, action_horizon=5, discrete_state_input=False
@@ -364,17 +314,6 @@ _CONFIGS = [
         num_train_steps=30_000,
     ),
     TrainConfig(
-        name="pi0_realworld",
-        model=pi0_config.Pi0Config(action_horizon=10),
-        data=LeRobotRealworldDataConfig(
-            repo_id="realworld_franka_bin_relocation",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(assets_dir="checkpoints/torch/pi0_base/assets"),
-            extra_delta_transform=False,
-        ),
-        pytorch_weight_path="checkpoints/torch/pi0_base",
-    ),
-    TrainConfig(
         name="pi0_custom",
         model=pi0_config.Pi0Config(),
         data=CustomDataConfig(
@@ -387,6 +326,122 @@ _CONFIGS = [
             action_train_with_rotation_6d=False,  # User can add extra config in custom dataset
         ),
         pytorch_weight_path="checkpoints/torch/pi0_base",
+    ),
+    TrainConfig(
+        name="fold_towel_sm2sm",
+        model=pi0_config.Pi0Config(action_horizon=20),
+        data=LeRobotX2robotDataConfig(
+            repo_id="fold_towel_tele_0317_0318_0420",
+            mode="sm2sm",
+            state_history_size=3,
+            state_future_size=2,
+            # only_right_obs=True,
+            action_dim=28,
+            random_drop_master=0.10,
+            random_drop_history=0.50,
+            random_drop_future=0.50,
+            random_pos_offset=0.020,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base/params"
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/gaofeng/arm_ws/openpi-jet/checkpoints/fold_towel_gqy_0317_0318_sm2sm/fold_towel_gqy_0317_0318_sm2sm_h3f2_a20_dm10dh50df50po20/29999/params"),
+        batch_size=128,
+        # exp_name="checkout_chips_gqy_0312_sm2sm_h3f2_a20_dm10dh50df50po20",
+        # exp_name="fold_towel_gqy_03170318_sm2sm_h3f2_a20_dm10dh50df50po20",
+        # exp_name="fold_towel_gqy_031703180410_pi0base_sm2sm_h3f2_a20_dm10dh50df50po20",
+        # exp_name="fold_towel_gqy031703180410_cjx0415_pi0base_sm2sm_h3f2_a20_dm10dh50df50po20",
+        exp_name="fold_towel_gqy031703180410_cjx0415_hyj0415_pys0415_pi0base_sm2sm_h3f2_a20_dm10dh50df50po20",
+    ),
+    TrainConfig(
+        name="checkout_chips_sm2sm",
+        model=pi0_config.Pi0Config(action_horizon=20),
+        data=LeRobotX2robotDataConfig(
+            repo_id="checkout_chips_gqy_recap_sft,checkout_chips_gqy_recap_rollout", # RECAP
+            mode="sm2sm",
+            state_history_size=3,
+            state_future_size=2,
+            # only_right_obs=True,
+            action_dim=28,
+            random_drop_master=0.10,
+            random_drop_history=0.50,
+            random_drop_future=0.50,
+            random_pos_offset=0.020,
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base/params"),
+        batch_size=128,
+        # exp_name="checkout_chips_gqy_031203130605_sm2sm_h3f2_a20_dm10dh50df50po20", # DAgger
+        exp_name="checkout_chips_gqy_recap_sm2sm_h3f2_a20_dm10dh50df50po20", # RECAP
+    ),
+    TrainConfig(
+        name="restock_cola_sm2sm",
+        model=pi0_config.Pi0Config(action_horizon=20),
+        data=LeRobotX2robotDataConfig(
+            repo_id="restock_cola_gqy_recap_sft,restock_cola_gqy_recap_rollout", # RECAP
+            mode="sm2sm",
+            state_history_size=3,
+            state_future_size=2,
+            # only_right_obs=True,
+            action_dim=28,
+            random_drop_master=0.10,
+            random_drop_history=0.50,
+            random_drop_future=0.50,
+            random_pos_offset=0.020,
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base/params"),
+        batch_size=128,
+        exp_name="restock_cola_gqy_recap_sm2sm_h3f2_a20_dm10dh50df50po20", # RECAP
+    ),
+    TrainConfig(
+        name="fold_towel_sm2sm_mixsft",
+        model=pi0_config.Pi0Config(action_horizon=20),
+        data=LeRobotX2robotDataConfig(
+            repo_id="fold_towel_sft2of4_selected_eps_sm2sm_cjx40_hyj40_pys40",
+            mode="sm2sm",
+            state_history_size=3,
+            state_future_size=2,
+            # only_right_obs=True,
+            action_dim=28,
+            random_drop_master=0.10,
+            random_drop_history=0.50,
+            random_drop_future=0.50,
+            random_pos_offset=0.020,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base/params"
+        ),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("/mnt/public/gaofeng/arm_ws/openpi-jet/checkpoints/fold_towel_gqy_0317_0318_sm2sm/fold_towel_gqy_0317_0318_sm2sm_h3f2_a20_dm10dh50df50po20/29999/params"),
+        batch_size=128,
+        # exp_name="checkout_chips_gqy_0312_sm2sm_h3f2_a20_dm10dh50df50po20",
+        # exp_name="fold_towel_gqy_03170318_sm2sm_h3f2_a20_dm10dh50df50po20",
+        # exp_name="fold_towel_gqy_031703180410_pi0base_sm2sm_h3f2_a20_dm10dh50df50po20",
+        # exp_name="fold_towel_gqy031703180410_cjx0415_pi0base_sm2sm_h3f2_a20_dm10dh50df50po20",
+        exp_name="fold_towel_gqy031703180410_cjx0415_hyj0415_pys0415_pi0base_sm2sm_h3f2_a20_dm10dh50df50po20",
+    ),
+    TrainConfig(
+        name="pi05_fold_towel_sm2sm",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=20,
+            discrete_state_input=False,
+        ),
+        data=LeRobotX2robotDataConfig(
+            repo_id="fold_towel_tele_0317_0318_0420",
+            mode="sm2sm",
+            state_history_size=3,
+            state_future_size=2,
+            action_dim=28,
+            random_drop_master=0.10,
+            random_drop_history=0.50,
+            random_drop_future=0.50,
+            random_pos_offset=0.020,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base/params"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        batch_size=128,
+        exp_name="fold_towel_gqy031703180410_cjx0415_hyj0415_pys0415_pi05_sm2sm_h3f2_a20_dm10dh50df50po20",
     ),
     TrainConfig(
         name="pi05_isaaclab_stack_cube",
@@ -402,46 +457,6 @@ _CONFIGS = [
             "checkpoints/jax/pi05_base/params"
         ),
         pytorch_weight_path="checkpoints/torch/pi05_base",
-    ),
-    TrainConfig(
-        name="pi05_dualfranka_tcp_rot6d",
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=20, discrete_state_input=False
-        ),
-        data=DualFrankaTcpRot6dDataConfig(
-            repo_id="",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(assets_dir="checkpoints/torch/pi05_base/assets"),
-            extra_delta_transform=True,
-        ),
-        pytorch_weight_path="checkpoints/torch/pi05_base",
-    ),
-    TrainConfig(
-        name="pi0_droid_polaris",
-        model=pi0_config.Pi0Config(
-            action_horizon=10,
-            max_token_len=48,
-        ),
-        data=LeRobotPolarisDroidDataConfig(
-            repo_id="physical-intelligence/droid",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="assets/droid"),
-        ),
-        pytorch_weight_path="checkpoints/torch/pi0_droid_polaris",
-    ),
-    TrainConfig(
-        name="pi05_droid_polaris",
-        model=pi0_config.Pi0Config(
-            action_horizon=15,
-            pi05=True,
-            max_token_len=200,
-        ),
-        data=LeRobotPolarisDroidDataConfig(
-            repo_id="physical-intelligence/droid",
-            base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="assets/droid"),
-        ),
-        pytorch_weight_path="checkpoints/torch/pi05_droid_polaris",
     ),
 ]
 
@@ -477,9 +492,34 @@ def _override_with_model_path(config: TrainConfig, model_path: str) -> TrainConf
 
 def _override_with_data_kwargs(config: TrainConfig, data_kwargs: dict) -> TrainConfig:
     """Return a copy of the config with data_config set from openpi_data."""
+    data_kwargs = dict(data_kwargs)
     data_config = dataclasses.replace(config.data, **data_kwargs)
     replace_kwargs = {"data": data_config}
+
+    state_history_size = getattr(data_config, "state_history_size", 0)
+    state_future_size = getattr(data_config, "state_future_size", 0)
+    state_sequence_length = state_history_size + 1 + state_future_size
+    if (
+        state_sequence_length > 1
+        and dataclasses.is_dataclass(config.model)
+        and any(
+            field.name == "state_sequence_length"
+            for field in dataclasses.fields(config.model)
+        )
+    ):
+        replace_kwargs["model"] = dataclasses.replace(
+            config.model,
+            state_sequence_length=state_sequence_length,
+        )
     return dataclasses.replace(config, **replace_kwargs)
+
+
+def _override_with_asset_id(config: TrainConfig, asset_id: str) -> TrainConfig:
+    """Return a copy of the config with an explicit assets asset_id."""
+    data_config = config.data
+    new_assets = dataclasses.replace(data_config.assets, asset_id=asset_id)
+    new_data = dataclasses.replace(data_config, assets=new_assets)
+    return dataclasses.replace(config, data=new_data)
 
 
 def get_openpi_config(
@@ -487,6 +527,7 @@ def get_openpi_config(
     model_path: Optional[str] = None,
     batch_size: Optional[int] = None,
     repo_id: Optional[str] = None,
+    asset_id: Optional[str] = None,
     data_kwargs: Optional[dict] = None,
 ) -> TrainConfig:
     """Get a config by name.
@@ -498,6 +539,7 @@ def get_openpi_config(
         repo_id: Optional LeRobot repo_id or local data path to override.
             When using a local path, the original asset_id is preserved so
             that norm_stats can still be loaded from the model checkpoint.
+        asset_id: Optional explicit asset id for norm_stats lookup.
     """
     if config_name not in _CONFIGS_DICT:
         closest = difflib.get_close_matches(
@@ -516,8 +558,12 @@ def get_openpi_config(
 
     if repo_id is not None:
         original_repo_id = config.data.repo_id
-        new_assets = dataclasses.replace(config.data.assets, asset_id=original_repo_id)
+        new_assets = dataclasses.replace(
+            config.data.assets, asset_id=asset_id or original_repo_id
+        )
         new_data = dataclasses.replace(config.data, repo_id=repo_id, assets=new_assets)
         config = dataclasses.replace(config, data=new_data)
+    elif asset_id is not None:
+        config = _override_with_asset_id(config, asset_id)
 
     return config

@@ -1,0 +1,28 @@
+advantage:
+  value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/steam_sft/steam_model_ensemble1-20260621-16:17:00/steam_sft/checkpoints/global_step_16000/actor
+  batch_size: 256
+  num_dataloader_workers_per_gpu: 12
+  prefetch_factor: 2
+  label_mode: quantile
+  rollout_quantile: 0.3
+  expert_quantile: 0.8
+  tag: steam_k32_ensemble3_ckpt16000_wco_exp_and_rollout
+  model:
+    precision: bf16
+data:
+  model_type: pi0
+  robot_type: restock_cola_sm2sm
+  k: 32
+  camera_keys:
+  - face_view
+  - left_wrist_view
+  - right_wrist_view
+  prompt: restock the cola
+  train_data_paths:
+  - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_sft
+    type: sft
+  - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_rollout
+    type: rollout
+distributed:
+  backend: nccl
+  timeout: 3600
