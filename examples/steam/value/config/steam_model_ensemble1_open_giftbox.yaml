@@ -31,7 +31,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "steam_sft_clean_table_ygg06170618_seed7"
+    experiment_name: "steam_sft_open_giftbox_xpc06230629_seed7"
     logger_backends: ["wandb"]
 
   # Total training length is step-driven: max_steps bounds the run (keep it
@@ -48,7 +48,7 @@ data:
   train_data_paths:
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_sft
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg06170618_steam_sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg0618_steam_sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc0623_gqy0629_steam_sft
       type: "sft"
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_rollout
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_rollout

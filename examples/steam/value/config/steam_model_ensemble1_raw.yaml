@@ -31,7 +31,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "steam_sft_clean_table_ygg06170618_seed7"
+    experiment_name: "steam_sft_fold_towel_seed7"
     logger_backends: ["wandb"]
 
   # Total training length is step-driven: max_steps bounds the run (keep it
@@ -46,9 +46,9 @@ data:
   # One or more LeRobot datasets of success demos. Each entry must have a
   # dataset_path; extra fields like prompt / weight override per-dataset values.
   train_data_paths:
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_sft
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg06170618_steam_sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg0618_steam_sft
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg0618_steam_sft
       type: "sft"
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_rollout
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_rollout
@@ -70,7 +70,7 @@ data:
     - right_wrist_view
   # Pair sampling — same k for positive and negative. Negatives are
   # positive pairs fed in reversed order.
-  k: 64
+  k: 32
   only_success: true
 
   min_episode_length: null
@@ -99,7 +99,7 @@ actor:
     # Backbone load dtype for this run. Overrides the model default
     # (model/steam loads fp32) with bf16 to trade a little numerical
     # headroom for lower memory and higher throughput on this corpus.
-    precision: bf16
+    precision: bf16 # bf16
     fusion_hidden_dim: 512
     dropout: 0.1
     label_smoothing: 0.05

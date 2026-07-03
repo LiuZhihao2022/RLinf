@@ -25,32 +25,25 @@ runner:
     logger_backends: ["wandb"]
 
   max_epochs: -1
-  max_steps: 30000  # 总训练步数封顶（runner 取 epochs/steps 上限的 min）。每 save_interval=3000 存一次 ckpt，最终产出 global_step_30000
+  max_steps: 30000  # 总训练步数封顶；每 save_interval=3000 存一次，最终产出 global_step_30000
   val_check_interval: -1
   save_interval: 3000
 
 data:
   num_workers: 8
-  # Tag: loads meta/advantages_{tag}.parquet from each dataset
-  # If null, loads meta/advantages.parquet (legacy format)
+  # 从每个数据集读 meta/advantages_{tag}.parquet
   advantage_tag: steam_k32_ensemble3_ckpt16000_wco_exp_and_rollout
 
-  # Balance sampling weights by dataset length
   balance_dataset_weights: true
 
   seed: 42
 
+  # sft(专家) + dagger(人工纠正，作为非专家 rollout 池)
   train_data_paths:
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_sft
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_sft
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_sft
     - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg06170618_steam_sft
       type: "sft"
       weight: 1.0
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_rollout
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_rollout
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_rollout
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy062306250626_steam_rollout
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy0626_steam_dagger
       type: "rollout"
       weight: 1.0
 
@@ -69,15 +62,10 @@ actor:
     model_path: "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base_pytorch"
     model_type: "cfg_model"
     add_value_head: False
-    action_dim: 28            # x2robot action dim（默认是 7）
-    num_action_chunks: 20     # 匹配 fold_towel_sm2sm 的 action_horizon=20（默认是 10）
+    action_dim: 28            # x2robot action dim
+    num_action_chunks: 20     # action_horizon=20
     openpi:
-      # config_name: "fold_towel_sm2sm"
-      # config_name: "checkout_chips_sm2sm"
-      # config_name: "restock_cola_sm2sm"
       config_name: "clean_table_sm2sm"
-      # asset_id: "checkout_chips_recap" 
-      # asset_id: "restock_cola_recap"
       cfgrl_guidance_scale: 1.0
       unconditional_prob: 0.1
       train_expert_only: False
@@ -87,9 +75,7 @@ actor:
       state_history_size: 3
       state_future_size: 2
       state_step: 1
-      # repo_id: "restock_cola_recap"
-      # repo_id: "clean_table_steam"
-  
+
   optim:
     lr: 5.0e-5
     adam_beta1: 0.9
@@ -117,3 +103,4 @@ reward:
 
 critic:
   use_critic_model: False
+</content>

@@ -23,9 +23,9 @@ data:
   #       type: rollout
   #       failure_reward: -300.0
   train_data_paths:
-    - dataset_path: /path/to/sft_dataset
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg06170618_steam_sft
       type: sft
-    - dataset_path: /path/to/rollout_dataset
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy062306250626_steam_rollout
       type: rollout
 
   # "sft": all episodes successful (reward=-1/step, last=0)

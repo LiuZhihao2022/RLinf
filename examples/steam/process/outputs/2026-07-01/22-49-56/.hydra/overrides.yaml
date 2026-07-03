@@ -1,0 +1,2 @@
+- advantage.value_checkpoint=/mnt/public/guqiuyi/RLinf_active/logs/steam_sft/steam_value_ensemble3/checkpoints/global_step_16000/actor
+- data.train_data_paths=[{dataset_path:/mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy0626_steam_dagger,type:rollout}]
