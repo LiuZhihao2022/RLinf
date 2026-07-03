@@ -15,7 +15,8 @@ defaults:
 advantage:
   # value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/value_sft/x2robot_sft_value_fold_towel-20260520-20:54:17/value_sft/checkpoints/global_step_3000/actor/model_state_dict
   # value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/value_sft/x2robot_sft_value_checkout_chips-20260606-17:34:22/value_sft/checkpoints/global_step_3000/actor/model_state_dict
-  value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/value_sft/x2robot_sft_value-20260614-17:36:51/value_sft/checkpoints/global_step_3000/actor/model_state_dict
+  # value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/value_sft/x2robot_sft_value-20260614-17:36:51/value_sft/checkpoints/global_step_3000/actor/model_state_dict
+  value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/value_sft/x2robot_sft_value_clean_table-20260703-20:46:08/value_sft_clean_table/checkpoints/global_step_3000/actor/model_state_dict
   device: "cuda"
   batch_size: 1024
   flush_interval: 256
@@ -61,13 +62,15 @@ data:
   train_data_paths:
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_sft
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_sft
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg06170618_steam_sft
       robot_type: "x2robot"   # 原来是 "libero"
       type: "sft"
       weight: 1.0
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_rollout
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_rollout
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_rollout
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_rollout
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy062306250626_steam_rollout
       robot_type: "x2robot"   # 加上 rollout 数据集
       type: "rollout"
       weight: 1.0
