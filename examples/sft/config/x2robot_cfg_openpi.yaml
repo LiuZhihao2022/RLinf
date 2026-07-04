@@ -11,7 +11,7 @@ hydra:
     - file://${oc.env:EMBODIED_PATH}/config/
 
 cluster:
-  num_nodes: 2 # 1 node
+  num_nodes: 1 # 1 or 2 node
   component_placement:
     actor,env,rollout: all
 
@@ -20,7 +20,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "cfg_sft"
+    experiment_name: "recap_cfg_sft_clean_table_rollout"
     logger_backends: ["wandb"]
 
   max_epochs: 30000
@@ -42,12 +42,12 @@ data:
   train_data_paths:
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_sft
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg06170618_steam_sft
       type: "sft"
       weight: 1.0
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_recap_rollout
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_rollout
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_rollout
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy062306250626_steam_rollout
       type: "rollout"
       weight: 1.0
 
@@ -57,7 +57,7 @@ algorithm:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 16 # 8卡用32，16卡用16
+  micro_batch_size: 32 # 8卡用32，16卡用16
   global_batch_size: 256
   seed: 0
 
@@ -71,9 +71,9 @@ actor:
     openpi:
       # config_name: "fold_towel_sm2sm"
       # config_name: "checkout_chips_sm2sm"
-      config_name: "restock_cola_sm2sm"
+      config_name: "clean_table_sm2sm"
       # asset_id: "checkout_chips_recap" 
-      asset_id: "restock_cola_recap"
+      # asset_id: "restock_cola_recap"
       cfgrl_guidance_scale: 1.0
       unconditional_prob: 0.1
       train_expert_only: False
