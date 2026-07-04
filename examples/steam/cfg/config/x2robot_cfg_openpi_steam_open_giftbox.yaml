@@ -1,0 +1,111 @@
+defaults:
+  - model/pi0@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/sft/config/
+
+cluster:
+  num_nodes: 2 # 1 node
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "steam_cfg_sft_open_giftbox_dagger2"
+    logger_backends: ["wandb"]
+
+  max_epochs: -1
+  max_steps: 30000  # 总训练步数封顶；每 save_interval=3000 存一次，最终产出 global_step_30000
+  val_check_interval: -1
+  save_interval: 3000
+
+data:
+  num_workers: 8
+  # 从每个数据集读 meta/advantages_{tag}.parquet
+  advantage_tag: steam_k64_ensemble3_ckpt16000_wco_exp_and_rollout
+
+  balance_dataset_weights: true
+
+  seed: 42
+
+  # sft(专家) + dagger(人工纠正，作为非专家 rollout 池)
+  train_data_paths:
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc06230626062706280629_gqy0629_sby06290630_steam_sft
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc0703_steam_sft
+      type: sft
+      weight: 1.0
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_gqy07010702_steam_dagger
+      type: "rollout"
+      weight: 1.0
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy062306250626_steam_rollout
+    #   type: "rollout"
+    #   weight: 1.0
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16 # 8卡用32，16卡用16
+  global_batch_size: 256
+  seed: 0
+
+  model:
+    precision: null
+    model_path: "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base_pytorch"
+    model_type: "cfg_model"
+    add_value_head: False
+    action_dim: 28            # x2robot action dim
+    num_action_chunks: 20     # action_horizon=20
+    openpi:
+      config_name: "open_giftbox_sm2sm"
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: False
+      guidance_type: "positive"
+      positive_only_conditional: true
+    openpi_data:
+      state_history_size: 3
+      state_future_size: 2
+      state_step: 1
+
+  optim:
+    lr: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 5000
+    total_training_steps: 30000
+    min_lr: 0.0
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

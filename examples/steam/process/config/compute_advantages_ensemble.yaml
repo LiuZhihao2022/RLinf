@@ -36,6 +36,7 @@ advantage:
   # rollout_quantile: fraction of top rollout frames labelled True. Required.
   # (positive_quantile is still accepted as a deprecated alias for this.)
   rollout_quantile: 0.3
+
   # expert_quantile: fraction of top sft (expert) frames labelled True.
   # Optional — omit to label every sft frame True (historical behaviour).
   expert_quantile: 0.8
@@ -47,7 +48,8 @@ advantage:
 
 data:
   model_type: "pi0"
-  robot_type: "clean_table_sm2sm"
+  # robot_type: "clean_table_sm2sm"
+  robot_type: "open_giftbox_sm2sm"
 
   # Pair stride — must match the training-time data.k for the loaded
   # checkpoint. Mismatching k changes the temporal scale the model was
@@ -61,17 +63,21 @@ data:
     - left_wrist_view
     - right_wrist_view
 
-  prompt: "Clean the dinner table."
+  # prompt: "Clean the dinner table."
+  prompt: "Open the giftbox."
 
   # Same dataset list as the training config so the corpus the ensemble
   # was trained on is scored. Override per run as needed.
   train_data_paths:
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg06170618_steam_sft
-    #   type: sft
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc06230626062706280629_gqy0629_sby06290630_steam_sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc0703_steam_sft
+      type: sft
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy062306250626_steam_rollout
     #   type: rollout
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy0626_steam_dagger
-      type: rollout
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy0626_steam_dagger
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_gqy07010702_steam_dagger
+    #   type: rollout
 
 distributed:
   backend: "nccl"
