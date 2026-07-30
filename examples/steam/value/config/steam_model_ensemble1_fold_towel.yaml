@@ -31,7 +31,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "steam_sft_open_giftbox"
+    experiment_name: "steam_sft_fold_towel"
     logger_backends: ["wandb"]
 
   # Total training length is step-driven: max_steps bounds the run (keep it
@@ -46,27 +46,14 @@ data:
   # One or more LeRobot datasets of success demos. Each entry must have a
   # dataset_path; extra fields like prompt / weight override per-dataset values.
   train_data_paths:
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc0623_gqy0629_steam_sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_steam_sft
       type: "sft"
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc0703_steam_sft
-    #   type: "sft"
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc0708_steam_sft
-    #   type: "sft"
-    # DAgger takeover-segment data: failure segment (before takeover) trained
-    # with `fail_loss_mode` (hinge / ce_zero), recovery segment (after
-    # takeover) trained as expert. Non-takeover subtasks are skipped.
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_gqy07010702_steam_dagger
-      type: "dagger"
 
   # When mixing multiple train datasets, sample according to each entry's
   # optional `weight` and optionally rebalance by dataset length.
   balance_weights: true
   seed: 42 # 42 17 7
   dataset_type: sft
-  # DAgger failure-segment loss: "hinge" (only pushes E[b] <= -margin) or
-  # "ce_zero" (CE against the near-zero bin). Override per server, e.g.
-  # data.fail_loss_mode=hinge  /  data.fail_loss_mode=ce_zero.
-  fail_loss_mode: hinge
 
   # Camera view names that the PairDataset loads from each LeRobot sample.
   # Any missing views become zero-placeholders with mask=False in the
@@ -77,7 +64,7 @@ data:
     - right_wrist_view
   # Pair sampling — same k for positive and negative. Negatives are
   # positive pairs fed in reversed order.
-  k: 64
+  k: 32
   only_success: true
 
   min_episode_length: null

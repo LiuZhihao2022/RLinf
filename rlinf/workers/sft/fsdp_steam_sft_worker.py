@@ -33,7 +33,7 @@ built around:
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 os.environ["LIBAV_LOG_LEVEL"] = "quiet"
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
@@ -237,6 +237,7 @@ class FSDPSteamSftWorker(FSDPModelManager, Worker):
 
         from rlinf.data.datasets.steam import (
             BinaryPairDataCollator,
+            DaggerPairDataset,
             PairDataset,
         )
         from rlinf.data.datasets.steam.mixture import PairMixtureDataset
@@ -349,7 +350,7 @@ class FSDPSteamSftWorker(FSDPModelManager, Worker):
                 return os.path.join(data_root, path)
             return path
 
-        def _build_pair_dataset(entry: dict) -> PairDataset:
+        def _build_pair_dataset(entry: dict):
             ds_path = _resolve(entry["dataset_path"])
             if "type" in entry:
                 dataset_type = str(entry["type"]).lower()
@@ -360,10 +361,39 @@ class FSDPSteamSftWorker(FSDPModelManager, Worker):
                     "Binary value PairDataset requires an explicit data.dataset_type "
                     f"or train_data_paths[*].type for dataset_path={ds_path!r}."
                 )
-            if dataset_type not in ("sft", "rollout"):
+            if dataset_type not in ("sft", "rollout", "dagger"):
                 raise ValueError(
-                    f"Binary value dataset type must be 'sft' or 'rollout', "
-                    f"got {dataset_type!r} for dataset_path={ds_path!r}."
+                    "Binary value dataset type must be 'sft', 'rollout' or "
+                    f"'dagger', got {dataset_type!r} for dataset_path={ds_path!r}."
+                )
+            camera_keys = tuple(
+                data_cfg.get(
+                    "camera_keys",
+                    ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+                )
+            )
+            if dataset_type == "dagger":
+                # DAgger takeover-segment dataset: failure segment (hinge or
+                # ce_zero) + recovery segment (expert). No length scaling.
+                fail_loss_mode = str(
+                    entry.get(
+                        "fail_loss_mode",
+                        data_cfg.get("fail_loss_mode", "hinge"),
+                    )
+                ).lower()
+                return DaggerPairDataset(
+                    dataset_path=ds_path,
+                    camera_keys=camera_keys,
+                    k=k,
+                    num_bins=num_bins,
+                    fail_loss_mode=fail_loss_mode,
+                    multi_takeover=str(
+                        entry.get(
+                            "multi_takeover",
+                            data_cfg.get("multi_takeover", "simple"),
+                        )
+                    ).lower(),
+                    min_episode_length=data_cfg.get("min_episode_length", None),
                 )
             if "only_success" in entry:
                 only_success = entry["only_success"]
@@ -388,16 +418,7 @@ class FSDPSteamSftWorker(FSDPModelManager, Worker):
             )
             return PairDataset(
                 dataset_path=ds_path,
-                camera_keys=tuple(
-                    data_cfg.get(
-                        "camera_keys",
-                        (
-                            "base_0_rgb",
-                            "left_wrist_0_rgb",
-                            "right_wrist_0_rgb",
-                        ),
-                    )
-                ),
+                camera_keys=camera_keys,
                 k=k,
                 dataset_type=dataset_type,
                 only_success=only_success,
@@ -761,6 +782,11 @@ class FSDPSteamSftWorker(FSDPModelManager, Worker):
         forward_kwargs: dict[str, Any] = {}
         if member_idx is not None:
             forward_kwargs["member_idx"] = int(member_idx)
+        loss_mode = batch.get("loss_mode")
+        if loss_mode is not None:
+            forward_kwargs["loss_mode"] = loss_mode.to(
+                self.device, non_blocking=True
+            )
 
         with self.amp_context:
             result = self.model(
@@ -944,6 +970,7 @@ class FSDPSteamSftWorker(FSDPModelManager, Worker):
         observation: dict[str, Any],
         labels: torch.Tensor,
         ensemble_size: int,
+        loss_mode: Optional[torch.Tensor] = None,
     ) -> dict[str, float]:
         """Eval one batch over all members on the SAME inputs.
 
@@ -964,6 +991,8 @@ class FSDPSteamSftWorker(FSDPModelManager, Worker):
             forward_kwargs: dict[str, Any] = {}
             if member_idx is not None:
                 forward_kwargs["member_idx"] = member_idx
+            if loss_mode is not None:
+                forward_kwargs["loss_mode"] = loss_mode
             with self.amp_context:
                 result = self.model(
                     observation=observation, labels=labels, **forward_kwargs
@@ -1000,7 +1029,14 @@ class FSDPSteamSftWorker(FSDPModelManager, Worker):
                     batch_metrics: list[dict[str, float]] = []
                     for batch in loader:
                         observation, labels = self._prepare_input(batch)
-                        metrics = self._eval_batch(observation, labels, ensemble_size)
+                        eval_loss_mode = batch.get("loss_mode")
+                        if eval_loss_mode is not None:
+                            eval_loss_mode = eval_loss_mode.to(
+                                self.device, non_blocking=True
+                            )
+                        metrics = self._eval_batch(
+                            observation, labels, ensemble_size, eval_loss_mode
+                        )
                         batch_metrics.append(metrics)
                     if not batch_metrics:
                         continue

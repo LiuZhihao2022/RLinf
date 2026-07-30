@@ -569,6 +569,51 @@ class _BasePairDataset(Dataset):
             )
         return fallback
 
+    def _build_sample(
+        self,
+        *,
+        episode: int,
+        frame_idx_t: int,
+        frame_idx_tk: int,
+        prompt: str,
+        label,
+        raw_t: Optional[dict] = None,
+        raw_tk: Optional[dict] = None,
+        loss_mode: int = 0,
+    ) -> dict[str, Any]:
+        """Assemble the sample dict for a single labeled frame pair.
+
+        ``label`` is a Python ``int`` bin index in ``[0, num_bins)``. The
+        collator casts the batched column to ``torch.long``. Binary mode
+        (``num_bins == 2``) degenerates to ``0 = regress``, ``1 =
+        progress``, matching the multi-bin layout from
+        :func:`_signed_stride_to_bin`.
+
+        ``loss_mode`` selects the per-sample training loss downstream:
+        ``0`` = cross-entropy against ``label`` (expert / recovery / sft /
+        rollout), ``1`` = one-sided hinge that only pushes the expected
+        signed value ``<= -margin`` (DAgger failure segment). Defaults to
+        ``0`` so every existing caller is unchanged.
+        """
+        views_t, mask_t = self._load_views(episode, frame_idx_t, sample=raw_t)
+        views_tk, mask_tk = self._load_views(episode, frame_idx_tk, sample=raw_tk)
+
+        sample: dict[str, Any] = {
+            "image_t": views_t,
+            "image_tk": views_tk,
+            "image_mask_t": mask_t,
+            "image_mask_tk": mask_tk,
+            "prompt": prompt,
+            "label": label,
+            "episode": int(episode),
+            "frame_idx_t": int(frame_idx_t),
+            "frame_idx_tk": int(frame_idx_tk),
+            "loss_mode": int(loss_mode),
+            "source_name": self.source_name,
+        }
+
+        return sample
+
 
 # ---------------------------------------------------------------------------
 # Pair dataset
@@ -837,43 +882,6 @@ class PairDataset(_BasePairDataset):
             self._rng = np.random.default_rng()
         return self._rng
 
-    def _build_sample(
-        self,
-        *,
-        episode: int,
-        frame_idx_t: int,
-        frame_idx_tk: int,
-        prompt: str,
-        label,
-        raw_t: Optional[dict] = None,
-        raw_tk: Optional[dict] = None,
-    ) -> dict[str, Any]:
-        """Assemble the sample dict for a single labeled frame pair.
-
-        ``label`` is a Python ``int`` bin index in ``[0, num_bins)``. The
-        collator casts the batched column to ``torch.long``. Binary mode
-        (``num_bins == 2``) degenerates to ``0 = regress``, ``1 =
-        progress``, matching the multi-bin layout from
-        :func:`_signed_stride_to_bin`.
-        """
-        views_t, mask_t = self._load_views(episode, frame_idx_t, sample=raw_t)
-        views_tk, mask_tk = self._load_views(episode, frame_idx_tk, sample=raw_tk)
-
-        sample: dict[str, Any] = {
-            "image_t": views_t,
-            "image_tk": views_tk,
-            "image_mask_t": mask_t,
-            "image_mask_tk": mask_tk,
-            "prompt": prompt,
-            "label": label,
-            "episode": int(episode),
-            "frame_idx_t": int(frame_idx_t),
-            "frame_idx_tk": int(frame_idx_tk),
-            "source_name": self.source_name,
-        }
-
-        return sample
-
     def __getitem__(self, idx: int) -> dict[str, Any]:
         pair_position, is_positive = self._decode_sample_index(idx)
         episode, t, t_plus_k_binary = self._resolve_pair_position(pair_position)
@@ -953,6 +961,289 @@ class PairDataset(_BasePairDataset):
             label=label,
             raw_t=raw_t,
             raw_tk=raw_tk,
+        )
+
+
+# ---------------------------------------------------------------------------
+# DAgger pair dataset (takeover-derived failure / recovery segments)
+# ---------------------------------------------------------------------------
+
+
+def _subtask_spans_from_starts(
+    starts: Sequence[Optional[int]], length: int
+) -> list[tuple[int, int, int]]:
+    """Turn ``subtask_start_frames`` (START schema) into drawable spans.
+
+    Entry ``i`` is the START frame of subtask ``i``, so subtask ``i`` runs
+    until the next OBSERVED start. A ``None`` marks truncation (the first
+    unobserved subtask ends the sequence), so trailing ``None`` entries are
+    ignored and the last observed subtask runs to ``length``.
+
+    Returns a list of ``(start, end, subtask_index)`` with ``end > start``.
+    """
+    observed = [(i, int(s)) for i, s in enumerate(starts) if s is not None]
+    spans: list[tuple[int, int, int]] = []
+    for j, (i, s) in enumerate(observed):
+        e = observed[j + 1][1] if j + 1 < len(observed) else int(length)
+        if e > s:
+            spans.append((s, e, i))
+    return spans
+
+
+def read_episode_segments(dataset_path: str) -> dict[int, dict]:
+    """Read per-episode subtask + takeover metadata from ``meta/episodes.jsonl``.
+
+    The training frame-level parquet only carries ``is_success``; the
+    subtask boundaries (``subtask_start_frames``) and human-takeover moments
+    (``takeover_frames``) live only in ``meta/episodes.jsonl``. This is the
+    single place that opens that file for the value pipeline.
+
+    Episodes without usable subtask labels (missing / all-``None``
+    ``subtask_start_frames`` — e.g. a dropped episode) are skipped, so they
+    contribute no training pairs.
+
+    Returns ``{episode_index: {"subtask_starts": [...], "takeovers": [...],
+    "length": int}}``.
+    """
+    import json
+
+    path = os.path.join(dataset_path, "meta", "episodes.jsonl")
+    out: dict[int, dict] = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            starts = rec.get("subtask_start_frames")
+            if not starts or all(s is None for s in starts):
+                continue
+            out[int(rec["episode_index"])] = {
+                "subtask_starts": starts,
+                "takeovers": list(rec.get("takeover_frames", []) or []),
+                "length": int(rec["length"]),
+            }
+    return out
+
+
+class DaggerPairDataset(_BasePairDataset):
+    """Frame pairs from DAgger takeover segments for the offset predictor.
+
+    Only the subtask that contains a human takeover contributes training
+    pairs; every other subtask is autonomous-rollout quality and is skipped
+    (it is scored at inference and used for VLA training, never to train the
+    predictor). Within a takeover subtask ``s`` (multi-takeover rule
+    ``simple``: ``first``/``last`` = earliest/latest takeover in ``s``):
+
+    * **Failure segment** ``[start_s, first)`` — the policy entering failure.
+      Forward pairs ``(t, t+i)`` only, tagged ``loss_mode`` per
+      ``fail_loss_mode``:
+        - ``"hinge"`` → ``loss_mode=1``: a one-sided hinge downstream pushes
+          the expected signed value ``<= -margin`` (only the sign is
+          supervised; the bin ``label`` is an ignored placeholder).
+        - ``"ce_zero"`` → ``loss_mode=0``: plain cross-entropy against the
+          near-zero regressive bin ``num_bins//2 - 1`` ("no progress").
+    * **Recovery segment** ``[last, end_s)`` — human teleop = expert. Treated
+      exactly like expert data: forward pair → progress bin, reversed pair →
+      regress bin, both cross-entropy (``loss_mode=0``).
+
+    No length normalization is applied (raw signed stride → bin), matching
+    the current value-model runs.
+    """
+
+    def __init__(
+        self,
+        dataset_path: str,
+        *,
+        camera_keys: Sequence[str] = (
+            "base_0_rgb",
+            "left_wrist_0_rgb",
+            "right_wrist_0_rgb",
+        ),
+        k: int = 4,
+        num_bins: int = 2,
+        fail_loss_mode: str = "hinge",
+        multi_takeover: str = "simple",
+        min_episode_length: Optional[int] = None,
+        only_success: Optional[bool] = True,
+    ) -> None:
+        del min_episode_length, only_success  # eligibility is segment-driven
+        self.camera_keys = tuple(camera_keys)
+        if not self.camera_keys:
+            raise ValueError("camera_keys must be non-empty")
+        self.k = int(k)
+        if self.k < 1:
+            raise ValueError(f"k must be >= 1, got {self.k}")
+        self.num_bins = int(num_bins)
+        if self.num_bins < 2 or self.num_bins % 2 != 0:
+            raise ValueError(f"num_bins must be >= 2 and even, got {self.num_bins}")
+        if self.num_bins > 2 and (2 * self.k) % self.num_bins != 0:
+            raise ValueError(
+                f"For num_bins={self.num_bins} in multi-bin mode, 2*k must be a "
+                f"multiple of num_bins; got k={self.k} (2*k={2 * self.k})."
+            )
+        self.fail_loss_mode = str(fail_loss_mode).lower()
+        if self.fail_loss_mode not in ("hinge", "ce_zero"):
+            raise ValueError(
+                "DaggerPairDataset fail_loss_mode must be 'hinge' or 'ce_zero', "
+                f"got {fail_loss_mode!r}."
+            )
+        self.multi_takeover = str(multi_takeover).lower()
+        if self.multi_takeover not in ("simple",):
+            raise ValueError(
+                "DaggerPairDataset only supports multi_takeover='simple' for now, "
+                f"got {multi_takeover!r}."
+            )
+        # DAgger never trains under length normalization; expose the attribute
+        # so the worker's global-L_max guard treats this dataset as opted out.
+        self.length_scale_enabled = False
+        self.dataset_type = "dagger"
+        self._rng: np.random.Generator | None = None
+        self.source_name = str(dataset_path)
+
+        # Underlying frames are all final-success human-collected episodes;
+        # use the sft source path (no is_success scan) — eligibility here comes
+        # from the takeover segments, not from a success filter.
+        self._source = _LeRobotSource(
+            dataset_path, only_success=True, dataset_type="sft"
+        )
+        segments = read_episode_segments(dataset_path)
+        num_eps = self._source.num_episodes()
+
+        # Expand into a flat list of training pairs.
+        #   self._pairs[i]  = (episode, t, kind, seg_end_exclusive)
+        #   self._flat[j]   = (pair_index, is_positive)
+        # A recovery anchor emits 2 samples (pos + neg / rewind); a failure
+        # anchor emits 1 (forward only).
+        self._pairs: list[tuple[int, int, str, int]] = []
+        skipped_eps: list[int] = []
+        for ep, info in segments.items():
+            if ep < 0 or ep >= num_eps:
+                skipped_eps.append(ep)
+                continue
+            spans = _subtask_spans_from_starts(info["subtask_starts"], info["length"])
+            takeovers = sorted(int(t) for t in info["takeovers"])
+            for (s, e, _sub_i) in spans:
+                in_sub = [t for t in takeovers if s <= t < e]
+                if not in_sub:
+                    continue
+                first, last = in_sub[0], in_sub[-1]
+                # failure anchors: t in [s, first) with room for stride >= 1
+                for t in range(s, max(s, first - 1)):
+                    self._pairs.append((ep, t, "failure", first))
+                # recovery anchors: t in [last, e) with room for stride >= 1
+                for t in range(last, max(last, e - 1)):
+                    self._pairs.append((ep, t, "recovery", e))
+
+        self._flat: list[tuple[int, bool]] = []
+        for pi, (_ep, _t, kind, _se) in enumerate(self._pairs):
+            if kind == "recovery":
+                self._flat.append((pi, True))
+                self._flat.append((pi, False))
+            else:
+                self._flat.append((pi, True))
+
+        self._eligible = sorted({ep for ep, _t, _k, _s in self._pairs})
+        if not self._flat:
+            raise ValueError(
+                f"DaggerPairDataset: no takeover-segment pairs built from "
+                f"{self.source_name!r}. Check that meta/episodes.jsonl has "
+                "subtask_start_frames + takeover_frames."
+            )
+        n_fail = sum(1 for _e, _t, kind, _s in self._pairs if kind == "failure")
+        n_rec = sum(1 for _e, _t, kind, _s in self._pairs if kind == "recovery")
+        logger.info(
+            "DaggerPairDataset: dataset_path=%s, episodes_used=%d, k=%d, "
+            "num_bins=%d, fail_loss_mode=%s, failure_anchors=%d, "
+            "recovery_anchors=%d, total_samples=%d, skipped_out_of_range=%s",
+            self.source_name,
+            len(self._eligible),
+            self.k,
+            self.num_bins,
+            self.fail_loss_mode,
+            n_fail,
+            n_rec,
+            len(self._flat),
+            skipped_eps,
+        )
+
+    # -- DataLoader / mixture / worker compat -----------------------------
+    def set_epoch(self, epoch: int) -> None:
+        del epoch
+
+    @property
+    def length_scale_reference(self) -> Optional[float]:
+        return None
+
+    def set_length_scale_reference(self, reference: float) -> None:
+        del reference  # DAgger never length-scales
+
+    def eligible_episode_lengths(self) -> list[int]:
+        return [int(self._source.episode_length(ep)) for ep in self._eligible]
+
+    def _rng_for_worker(self) -> np.random.Generator:
+        if self._rng is None:
+            self._rng = np.random.default_rng()
+        return self._rng
+
+    def __len__(self) -> int:
+        return len(self._flat)
+
+    def __getitem__(self, idx: int) -> dict[str, Any]:
+        if idx < 0:
+            idx += len(self)
+        if not (0 <= idx < len(self)):
+            raise IndexError(idx)
+        pair_index, is_positive = self._flat[idx]
+        episode, t, kind, seg_end = self._pairs[pair_index]
+
+        max_valid_stride = min(self.k, seg_end - 1 - t)
+        if max_valid_stride < 1:
+            raise RuntimeError(
+                f"DaggerPairDataset: no valid stride for episode={episode} "
+                f"t={t} seg_end={seg_end} (bug in segment enumeration)."
+            )
+        i = int(self._rng_for_worker().integers(low=1, high=max_valid_stride + 1))
+
+        near_zero_bin = self.num_bins // 2 - 1  # least-regressive bin (~0)
+        if kind == "recovery":
+            # Human teleop = expert: forward → progress bin, reversed → regress.
+            if is_positive:
+                frame_idx_t, frame_idx_tk, signed_stride = t, t + i, i
+            else:
+                frame_idx_t, frame_idx_tk, signed_stride = t + i, t, -i
+            label: Any = _signed_stride_to_bin(signed_stride, self.k, self.num_bins)
+            loss_mode = 0
+        else:
+            # Failure segment: forward only.
+            frame_idx_t, frame_idx_tk = t, t + i
+            if self.fail_loss_mode == "hinge":
+                # Placeholder valid bin; the hinge loss ignores it and only
+                # pushes the expected signed value <= -margin.
+                label = near_zero_bin
+                loss_mode = 1
+            else:  # ce_zero
+                label = near_zero_bin
+                loss_mode = 0
+
+        raw_t, raw_tk = self._source.get_raw_pair(
+            episode,
+            frame_idx_t,
+            frame_idx_tk,
+            camera_keys=self.camera_keys,
+        )
+        prompt_sample = raw_t if frame_idx_t == t else raw_tk
+        prompt = self._resolve_prompt_from_sample(prompt_sample, episode, t)
+
+        return self._build_sample(
+            episode=episode,
+            frame_idx_t=frame_idx_t,
+            frame_idx_tk=frame_idx_tk,
+            prompt=prompt,
+            label=label,
+            raw_t=raw_t,
+            raw_tk=raw_tk,
+            loss_mode=loss_mode,
         )
 
 
@@ -1163,9 +1454,16 @@ ValueDataCollator`. Runs the :class:`SteamProcessor` **twice**
         # the _signed_stride_to_bin layout. Both feed straight into
         # ``F.cross_entropy`` with no further remapping.
         labels = torch.tensor([int(ex["label"]) for ex in examples], dtype=torch.long)
+        # Per-sample loss selector: 0 = cross-entropy against `label`
+        # (expert / recovery / sft / rollout), 1 = hinge on the expected
+        # signed value (DAgger failure segment). Absent → 0 (unchanged).
+        loss_mode = torch.tensor(
+            [int(ex.get("loss_mode", 0)) for ex in examples], dtype=torch.long
+        )
         return {
             "observation": observation,
             "labels": labels,
+            "loss_mode": loss_mode,
             "episode": episode,
             "frame_idx_t": frame_idx_t,
             "frame_idx_tk": frame_idx_tk,

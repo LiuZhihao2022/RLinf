@@ -1,0 +1,3 @@
+- advantage.value_checkpoint=/mnt/public/guqiuyi/RLinf_active/logs/steam_sft/open_giftbox_v1/steam_value_ensemble3/checkpoints/global_step_16000/actor
+- advantage.label_mode=threshold
+- +advantage.positive_threshold=0.0

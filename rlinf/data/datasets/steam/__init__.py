@@ -17,13 +17,17 @@
 from .mixture import PairMixtureDataset
 from .pair_dataset import (
     BinaryPairDataCollator,
+    DaggerPairDataset,
     PairDataset,
     TrajectorySource,
+    read_episode_segments,
 )
 
 __all__ = [
     "BinaryPairDataCollator",
+    "DaggerPairDataset",
     "PairMixtureDataset",
     "PairDataset",
     "TrajectorySource",
+    "read_episode_segments",
 ]

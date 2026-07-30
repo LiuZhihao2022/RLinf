@@ -1,0 +1,2 @@
+- advantage.value_checkpoint=/mnt/public/guqiuyi/RLinf_active/logs/steam_sft/fold_towel_v1/steam_value_ensemble3/checkpoints/global_step_8000/actor
+- data.train_data_paths=[{dataset_path:/mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_steam_sft,type:sft},{dataset_path:/mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_steam_dagger,type:rollout},{dataset_path:/mnt/public/guqiuyi/huggingface/lerobot/fold_towel_gqy_steam_rollout,type:rollout}]

@@ -164,6 +164,10 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
         self.config = config
         self.model = SteamBackbone(config)
         self.label_smoothing = float(config.label_smoothing)
+        # Margin for the DAgger failure-segment hinge loss. Samples tagged
+        # loss_mode == 1 are pushed toward expected signed value <= -margin
+        # (only the sign is supervised). Default 0.1; override via config.
+        self.failure_margin = float(getattr(config, "failure_margin", 0.1))
         self.gradient_checkpointing_enabled = False
 
         # FSDP wrap-name tagging (mirrors value_model/modeling_critic.py:160-162)
@@ -386,14 +390,23 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
     # Forward / predict
     # ------------------------------------------------------------------
 
-    def forward(self, observation, labels=None, **kwargs) -> CriticOutput:
+    def forward(
+        self, observation, labels=None, *, loss_mode=None, **kwargs
+    ) -> CriticOutput:
         """Forward pass — parallel to ValueCriticModel.forward.
 
         Stacks the observation, runs the multimodal backbone, takes
         softmax over the ``num_bins``-wide head, and — if ``labels`` are
-        provided — computes cross-entropy + accuracy via
+        provided — computes the per-sample loss + accuracy via
         :meth:`_compute_loss`. Returns a fully populated
         :class:`CriticOutput`.
+
+        ``loss_mode`` (optional ``[B]`` long tensor) selects the per-sample
+        loss: ``0`` = cross-entropy against ``labels`` (expert / recovery /
+        sft / rollout); ``1`` = one-sided hinge ``max(0, E[b] + margin)`` on
+        the expected signed value ``E[b]`` (DAgger failure segment), where
+        the ``labels`` entry is an ignored placeholder. Absent / all-zero →
+        the original unweighted cross-entropy path.
         """
         input_ids, attention_mask, images, image_mask = self._stack_observation(
             observation
@@ -421,7 +434,20 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
         expert_loss = None
         cat_metrics = None
         if labels is not None:
-            expert_loss, cat_metrics = self._compute_loss(logits, labels)
+            per_sample_ce, cat_metrics = self._compute_loss(logits, labels)
+            if loss_mode is not None:
+                lm = loss_mode.to(per_sample_ce.device).view(-1)
+                # Hinge on the expected signed value E[b] in [-1, 1]: only the
+                # sign is supervised (push E[b] <= -margin), never the
+                # magnitude. progress_values already holds E[b].
+                hinge = torch.clamp(
+                    progress_values.to(per_sample_ce.dtype) + self.failure_margin,
+                    min=0.0,
+                )
+                is_hinge = lm == 1
+                expert_loss = torch.where(is_hinge, hinge, per_sample_ce)
+            else:
+                expert_loss = per_sample_ce
 
         expert_loss_mean = expert_loss.mean() if expert_loss is not None else None
         total_loss = expert_loss_mean

@@ -1,0 +1,1 @@
+python /mnt/public/guqiuyi/RLinf_active/examples/steam/process/visualize_advantage.py --dataset /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg06170618_steam_sft --tag steam_k64_ensemble3_ckpt16000_wco_exp_and_rollout --output /mnt/public/guqiuyi/RLinf_active/visualization/clean_table_ygg06170618_steam_sft --episodes 10

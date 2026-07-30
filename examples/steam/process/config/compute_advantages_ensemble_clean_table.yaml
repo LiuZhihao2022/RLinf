@@ -63,21 +63,17 @@ data:
     - left_wrist_view
     - right_wrist_view
 
-  # prompt: "Clean the dinner table."
-  prompt: "Open the giftbox."
+  prompt: "Clean the dinner table."
 
   # Same dataset list as the training config so the corpus the ensemble
   # was trained on is scored. Override per run as needed.
   train_data_paths:
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg06170618_steam_sft
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc06230626062706280629_gqy0629_sby06290630_steam_sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc0703_steam_sft
-      type: sft
+    #   type: sft
     # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy062306250626_steam_rollout
     #   type: rollout
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy0626_steam_dagger
-    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_gqy07010702_steam_dagger
-    #   type: rollout
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy0626_steam_dagger
+      type: rollout
 
 distributed:
   backend: "nccl"

@@ -1,0 +1,4 @@
+- advantage.value_checkpoint=/mnt/public/guqiuyi/RLinf_active/logs/steam_sft/steam_model_ensemble1_open_giftbox-20260717-00:49:37/steam_sft_open_giftbox_dagger_cezero_seed7_k64_2node/checkpoints/global_step_16000/actor
+- advantage.tag=steam_k32_dagger_cezero_ckpt16000
+- data.k=32
+- data.train_data_paths=[{dataset_path:/mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_gqy07010702_steam_dagger,type:rollout}]
