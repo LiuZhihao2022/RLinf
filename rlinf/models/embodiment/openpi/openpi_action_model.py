@@ -499,6 +499,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return result
 
     def obs_processor(self, env_obs):
+        # x2robot / ARX (dual-arm): ArxInputs expects a nested images dict +
+        # top-level state/prompt (RLinf setup_wrappers has no repack). The
+        # realworld obs_processor below emits observation/* keys instead, so
+        # route x2robot obs to the arx contract here.
+        if any(m in self.config.config_name for m in ("sm2sm", "sm2m", "s2m", "s2s")):
+            extra = env_obs["extra_view_images"]  # stacked wrist views [B, 2, ...] = [left, right]
+            return {
+                "images": {
+                    "face_view": env_obs["main_images"],
+                    "left_wrist_view": extra[:, 0],
+                    "right_wrist_view": extra[:, 1],
+                },
+                "state": env_obs["states"],
+                "prompt": env_obs["task_descriptions"],
+            }
         processed_obs = {
             "observation/image": env_obs["main_images"],
             "prompt": env_obs["task_descriptions"],

@@ -601,6 +601,26 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         return flow_loss, metrics
 
     def obs_processor(self, env_obs):
+        # x2robot / ARX (dual-arm): the CFG input_transform routes each sample
+        # into ArxInputs, which wants a nested images dict + top-level state +
+        # prompt; the guidance prompts must stay present so they get tokenized.
+        if any(m in self.config.config_name for m in ("sm2sm", "sm2m", "s2m", "s2s")):
+            descs = env_obs["task_descriptions"]
+            extra = env_obs["extra_view_images"]  # stacked wrist views [B, 2, ...] = [left, right]
+            state = env_obs["states"]
+            if torch.is_tensor(state):
+                state = state.to(dtype=torch.float32)
+            return {
+                "images": {
+                    "face_view": env_obs["main_images"],
+                    "left_wrist_view": extra[:, 0],
+                    "right_wrist_view": extra[:, 1],
+                },
+                "state": state,
+                "prompt": descs,
+                "positive_guidance_prompt": [f"{d}\nAdvantage: positive" for d in descs],
+                "negative_guidance_prompt": [f"{d}\nAdvantage: negative" for d in descs],
+            }
         processed_obs = {
             "observation/image": env_obs["main_images"],
             "prompt": env_obs["task_descriptions"],
