@@ -1,0 +1,150 @@
+# STEAM 2.0 value model SFT (clean_table) — RLinf FSDP runner.
+#
+# 用法:
+#   bash examples/steam/value/run_steam_sft.sh steam2_model_clean_table \
+#       data.seed=7 \
+#       runner.logger.experiment_name=steam2_clean_table_dagger_hinge_seed7_k64
+#
+# 相对 STEAM 1.0 的 steam_model_ensemble1_clean_table.yaml，只有两处实质变化:
+#   1. train_data_paths 加了一条 type: "dagger" 的 DAgger 数据集
+#      （接管前失败段走 fail_loss_mode，接管后恢复段当专家，非接管子任务不产样本）
+#   2. 新增 data.fail_loss_mode
+# 其余超参（k=64 / num_bins=32 / ensemble_size=1 / max_steps=16000 /
+# global_batch=512）与 STEAM 1.0 clean_table 那次训练保持一致，便于对照。
+#
+# 并行度按 8 卡 A800 单节点设置（num_nodes=1 + micro_batch_size=32 ⇒ 全局 512），
+# STEAM 1.0 那次是 16 卡（num_nodes=2 + micro 16），全局 batch 相同。
+
+defaults:
+  - model/steam@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/sft/config/
+
+cluster:
+  num_nodes: 1 # 8卡用1，16卡用2
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "steam2_clean_table_dagger_hinge_seed7_k64"
+    logger_backends: ["wandb"]
+
+  # 训练长度由步数决定: max_steps 与 actor.optim.total_training_steps 保持一致;
+  # max_epochs: -1 表示不按 epoch 限制。
+  max_epochs: -1
+  max_steps: 16000
+  val_check_interval: -1
+  save_interval: 4000
+
+data:
+  train_data_paths:
+    # 专家示范。与 STEAM 1.0 clean_table 那次训练用的是同一个数据集
+    # （实验名里的 ygg0618 即指这一份，130 episodes / 344k 帧）。
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg0618_steam_sft
+      type: "sft"
+    # DAgger 接管段数据。这一份是「去静止帧后重新转换 + 子任务帧号映射 + 接管时刻」
+    # 的版本，与 /mnt/resource 下那份未过滤的同名数据集不是一回事，注意别指错。
+    #   失败段 [子任务起点, 首次接管)   -> fail_loss_mode (hinge / ce_zero)
+    #   恢复段 [末次接管, 子任务终点)   -> 当专家，正反向对都走 CE
+    #   非接管子任务                    -> 不产训练样本
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_hzp0731_steam_dagger
+      type: "dagger"
+
+  balance_weights: true
+  seed: 7 # 42 17 7
+  dataset_type: sft
+  # DAgger 失败段损失: "hinge" 只把 E[b] 压到 <= -margin（只监督符号）;
+  # "ce_zero" 对近零 bin 做交叉熵。命令行覆盖: data.fail_loss_mode=ce_zero
+  fail_loss_mode: hinge
+
+  # PairDataset 从每个 LeRobot 样本加载的相机名。缺失的视角会补零并置 mask=False，
+  # 在相机 mean-pool 时被屏蔽。
+  camera_keys:
+    - face_view
+    - left_wrist_view
+    - right_wrist_view
+  # 帧对采样的 stride 上界 k_max（正负样本同一个 k，负样本是正样本倒序）。
+  # 注意与 Step 2 打 advantage 时的 data.k（固定前视步长）不是同一个量，可以不同。
+  k: 64
+  only_success: true
+
+  min_episode_length: null
+
+  train_num_workers: 8
+  eval_num_workers: 4
+  prefetch_factor: 4
+  persistent_workers: false
+  pin_memory: false
+  do_augment: false
+
+algorithm:
+  adv_type: gae   # 此处不用，保留以对齐配置结构
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32 # 8卡用32，16卡用16
+  global_batch_size: 512
+  seed: 0
+
+  model:
+    # 本次运行的 backbone 载入精度，覆盖 model/steam 的 fp32 默认值。
+    precision: bf16
+    fusion_hidden_dim: 512
+    dropout: 0.1
+    label_smoothing: 0.05
+    num_frames_per_pair: 2
+    num_bins: 32 # 可改小，好训练一些
+    vision_repo_id: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/siglip2-so400m-patch14-224"
+    language_repo_id: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/gemma-3-270m"
+    tokenizer_path: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/gemma-3-270m"
+    freeze_vision_encoder: false
+    freeze_language_model: false
+    include_state_in_prompt: false
+    max_state_dim: 32
+    state_discretization_bins: 256
+    max_token_len: 200
+    ensemble_size: 1
+    ensemble_head_seed_base: 0
+    use_gradient_checkpointing: true
+
+  optim:
+    lr: 5.0e-5
+    value_lr: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-5
+    clip_grad: 10.0
+    lr_scheduler: "constant"
+    lr_warmup_steps: 500
+    total_training_steps: 16000
+    min_lr: 1.0e-6
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: true
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

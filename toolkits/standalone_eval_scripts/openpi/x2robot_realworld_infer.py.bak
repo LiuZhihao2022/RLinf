@@ -36,7 +36,6 @@ import logging
 import os
 import socket
 import struct
-import time
 from collections import deque
 from typing import Any
 
@@ -88,21 +87,6 @@ class Args:
     num_steps: int = 10
 
     device: str = "cuda"
-
-    # --- torch.compile (matches openpi's deployed latency; see main()) ---
-    # OpenPi0ForCFGActionPrediction.__init__ discards the torch.compile that
-    # PI0Pytorch.__init__ applies to sample_actions, so this server would
-    # otherwise run the CFG sampler fully eager (~3.6x slower, measured).
-    no_compile: bool = False          # --no-compile -> run eager
-    compile_mode: str = "max-autotune"
-    # Synthetic inferences before accepting connections, so the robot never
-    # pays the one-off max-autotune cost (~30-150 s) on its first control step.
-    warmup_steps: int = 3
-
-    # --- profiling (mirrors openpi's --profile-infer) ---
-    profile_infer: bool = False
-    profile_warmup: int = 3
-    profile_report_every: int = 1
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -254,52 +238,6 @@ def _blend_chunk_transition(
 # RLinf inference wrapper — replaces openpi policy.infer / _cfg_infer.
 # Returns the full predicted chunk (action_horizon, 28).
 # ═══════════════════════════════════════════════════════════════════════════
-def _infer_profile_log(times_ms: list, prefix: str = "") -> None:
-    """Same p50/p99 report as openpi's x2robot_infer_seq_qiuyi.py."""
-    if not times_ms:
-        return
-    a = np.asarray(times_ms, dtype=np.float64)
-    logging.info(
-        "%sinfer profile: n=%d  mean=%.2f ms  p50=%.2f ms  p99=%.2f ms",
-        prefix, len(a), float(np.mean(a)),
-        float(np.percentile(a, 50)), float(np.percentile(a, 99)),
-    )
-
-
-def enable_compile(model, mode: str = "max-autotune") -> None:
-    """Restore the torch.compile that the CFG subclass drops.
-
-    ``PI0Pytorch.__init__`` (openpi pi0_pytorch.py:112) sets
-    ``self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")``,
-    but ``OpenPi0ForCFGActionPrediction.__init__`` saves the *uncompiled* bound
-    method before calling ``super().__init__`` and restores it afterwards, so the
-    compile is thrown away.  openpi's deployed script keeps that compile and
-    additionally binds a compiled CFG sampler
-    (x2robot_infer_seq_qiuyi.py:691-700); without this the two-pass CFG denoise
-    loop runs eager at ~3.6x the compiled latency, which blows past the
-    ``latency_step`` round-trip budget and makes the arm stutter at every chunk
-    boundary.
-    """
-    torch.set_float32_matmul_precision("high")
-    model.sample_actions = torch.compile(model.sample_actions, mode=mode)
-
-
-def _warmup(model, args: Args, n: int) -> None:
-    """Trigger compilation on synthetic obs so the first real step is fast."""
-    if n <= 0:
-        return
-    state_seq_len = args.state_history_size + 1 + args.state_future_size
-    rng = np.random.default_rng(0)
-    for i in range(n):
-        imgs = [rng.integers(0, 255, (480, 640, 3), dtype=np.uint8) for _ in range(3)]
-        state = rng.standard_normal((state_seq_len, 32)).astype(np.float32)
-        t0 = time.perf_counter()
-        rlinf_infer(model, imgs[0], imgs[1], imgs[2], state, args.prompt)
-        logging.info(
-            "warmup %d/%d: %.1f ms", i + 1, n, (time.perf_counter() - t0) * 1000
-        )
-
-
 @torch.no_grad()
 def rlinf_infer(model, camera_left, camera_front, camera_right, state, prompt) -> np.ndarray:
     env_obs = {
@@ -323,22 +261,8 @@ def main(args: Args) -> None:
 
     model, norm_stats = load_cfg_model(args)
 
-    if args.no_compile:
-        logging.warning(
-            "--no-compile: CFG sampler runs eager (~3.6x slower than compiled; "
-            "exceeds the latency_step=%d round-trip budget on real hardware)",
-            args.latency_step,
-        )
-    else:
-        logging.info("enabling torch.compile(mode=%r) on sample_actions", args.compile_mode)
-        enable_compile(model, args.compile_mode)
-    _warmup(model, args, 0 if args.no_compile else args.warmup_steps)
-
     state_seq_len = args.state_history_size + 1 + args.state_future_size
     latency_len = args.state_history_size + 1 + args.latency_step
-
-    infer_times_ms: list = []
-    infer_count = 0
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setblocking(True)
@@ -403,18 +327,9 @@ def main(args: Args) -> None:
                             state[:, 14:21] = mean[..., 14:21]
 
                     # ── RLinf CFG inference ──
-                    if args.profile_infer:
-                        _t0 = time.perf_counter()
                     action_pred = rlinf_infer(
                         model, camera_left, camera_front, camera_right, state, args.prompt
                     )  # (action_horizon, 28)
-                    if args.profile_infer:
-                        infer_count += 1
-                        _dt_ms = (time.perf_counter() - _t0) * 1000
-                        if infer_count > args.profile_warmup:
-                            infer_times_ms.append(_dt_ms)
-                            if len(infer_times_ms) % args.profile_report_every == 0:
-                                _infer_profile_log(infer_times_ms)
 
                     if args.policy_mode == "sm2sm":
                         action_pred = action_pred[:, 14:28]  # master action (14-d)
@@ -446,11 +361,7 @@ def main(args: Args) -> None:
                     conn.close()
                 except OSError:
                     pass
-    except KeyboardInterrupt:
-        pass
     finally:
-        if args.profile_infer:
-            _infer_profile_log(infer_times_ms, prefix="[final] ")
         sock.close()
 
 
