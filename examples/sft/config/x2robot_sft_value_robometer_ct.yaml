@@ -1,0 +1,126 @@
+# Usage: bash run_value_sft.sh libero_sft_value
+
+defaults:
+  - model/value@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1 # 8卡用1，16卡用2
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "robometer_value_sft_clean_table"
+    logger_backends: ["wandb"]
+
+  max_epochs: 10000
+  max_steps: -1
+  val_check_interval: 500
+  save_interval: 3000
+
+data: 
+  tag: "rbm_n64_mapB"
+
+  train_data_paths:
+    - dataset_path: /mnt/resource/steam_dataset/clean_table/lerobot/clean_table_ygg06170618_steam_sft
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_sft
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_sft
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_ygg06170618_steam_sft
+      type: "sft"
+      weight: 1.0
+      robot_type: "x2robot"
+      model_type: "pi0"
+
+    - dataset_path: /mnt/resource/steam_dataset/clean_table/lerobot/clean_table_gqy062306250626_steam_rollout
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/checkout_chips_gqy_recap_rollout
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/restock_cola_gqy_recap_rollout
+    # - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/clean_table_gqy062306250626_steam_rollout
+      type: "rollout"
+      weight: 1.0
+      robot_type: "x2robot"
+      model_type: "pi0"
+
+  # eval_data_paths:
+  #   - dataset_path: "/path/to/eval_dataset"
+  #     max_samples: 10000
+  #     robot_type: "libero"
+  #     model_type: "pi05"
+
+  # ----- dataloader performance -----
+  train_num_workers: 8
+  eval_num_workers: 0
+  prefetch_factor: 4
+  persistent_workers: false
+  pin_memory: false
+  # ----- shared dataset params -----
+  include_state: true # 不会影响value model，输入没有state
+  gamma: 1.0
+  action_horizon: 10
+  normalize_to_minus_one_zero: true
+  include_next_obs: false
+  action_dim: 28
+  robot_type: "x2robot"
+  model_type: "pi0"
+
+  # ----- mixture settings -----
+  balance_weights: true
+  seed: 42
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32 # 8卡用32，16卡用16
+  global_batch_size: 256
+  seed: 0
+
+  model:
+    precision: bf16
+    siglip_path: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/siglip2-so400m-patch14-224"
+    gemma3_path: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/gemma-3-270m"
+    tokenizer_path: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/gemma-3-270m"
+    freeze_vlm: false
+    action_dim: 28
+    action_horizon: 20
+
+  optim:
+    lr: 5.0e-5
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1e-10
+    clip_grad: 1.0
+    lr_scheduler: "constant"
+    lr_warmup_steps: 500
+    total_training_steps: 8000
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

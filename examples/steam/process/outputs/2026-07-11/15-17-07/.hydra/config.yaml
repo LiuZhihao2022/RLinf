@@ -1,0 +1,27 @@
+advantage:
+  value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/steam_sft/open_giftbox_v1/steam_value_ensemble3/checkpoints/global_step_16000/actor
+  batch_size: 256
+  num_dataloader_workers_per_gpu: 12
+  prefetch_factor: 2
+  label_mode: threshold
+  rollout_quantile: 0.6
+  expert_quantile: 0.8
+  tag: steam_k32_ensemble3_ckpt16000_wco_exp_and_rollout
+  model:
+    precision: bf16
+  positive_threshold: 0.0
+data:
+  model_type: pi0
+  robot_type: open_giftbox_sm2sm
+  k: 32
+  camera_keys:
+  - face_view
+  - left_wrist_view
+  - right_wrist_view
+  prompt: Open the giftbox.
+  train_data_paths:
+  - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/open_giftbox_xpc0708_steam_sft
+    type: sft
+distributed:
+  backend: nccl
+  timeout: 3600
