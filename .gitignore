@@ -12,6 +12,7 @@ build
 docs/build
 dist
 logs/*
+examples/steam/process/outputs*
 pretrained_models/*
 outputs/*
 *.so
