@@ -1,0 +1,102 @@
+# NOTE — 这是「B」半份，与 partA 同时在另一台 8 卡机上跑。
+#
+# ⚠️ tag 是 steam_k32_ensemble3_ckpt16000_raw（raw = 临时）。两半各自算出的 expert_quantile
+# 阈值只覆盖自己那部分数据，**不是全局阈值**，因此 bool 列不可直接使用。
+# 两半都跑完后必须执行 relabel_advantages.py，把 9 个数据集的
+# advantage_continuous 汇总重算一次全局阈值，产出最终 tag。
+# 命令见 §跑法（相邻的 README 或对话记录）。
+#
+# 本半份：5 个数据集，每卡 386 个 batch，约 52 分钟。
+
+# Advantage computation using the STEAM ensemble value model — bagging_4sku.
+#
+# The label written per frame is ``True`` iff the ensemble-aggregated
+# p(progress) of the pair (frame_t, frame_{t+k}) exceeds the pool's quantile
+# threshold. Here every dataset is ``type: sft``, so only the expert pool is
+# used (``expert_quantile``); the rollout pool stays empty.
+#
+# Usage:
+#   cd examples/steam/process
+#   bash run_compute_advantages_ensemble.sh compute_advantages_ensemble_bagging_4sku --nproc 8
+
+advantage:
+  # Ensemble-3 merged from seeds 7 / 42 / 17 (all trained k=64, num_bins=32,
+  # 16000 steps). config.json in this dir carries ensemble_size=3, which is
+  # what the labelling script reads — the yaml cannot override it.
+  value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/steam_sft/bagging_4sku_v1/steam_value_ensemble3/checkpoints/global_step_16000/actor
+
+  # Ensemble does K forward passes per sample on a 2-frame pair, so batch
+  # size sits well below the value-regression default of 1024.
+  batch_size: 256
+  num_dataloader_workers_per_gpu: 12
+  prefetch_factor: 2
+
+  # Required. "threshold" labels advantage = advantage_continuous >
+  # positive_threshold (rollout only; sft frames always True). "quantile"
+  # labels the top rollout_quantile fraction of rollout frames and, when
+  # expert_quantile is set, the top expert_quantile fraction of sft frames;
+  # the two pools are scored independently.
+  label_mode: quantile
+
+  # advantage_continuous > positive_threshold ⇒ advantage = True (rollout
+  # only). Used only when label_mode == threshold.
+  # positive_threshold: 0.8
+
+  # label_mode == quantile knobs (fractions in (0, 1)).
+  # rollout_quantile is required by the script even when no dataset is
+  # tagged ``rollout`` — kept at the project default; it has no effect here.
+  rollout_quantile: 0.6
+  # expert_quantile: fraction of top sft (expert) frames labelled True.
+  # NOTE: the threshold is computed over ALL sft datasets pooled together
+  # (one global quantile, not per-dataset), so a systematically
+  # lower-scoring dataset will receive proportionally fewer positives.
+  expert_quantile: 0.8
+
+  tag: steam_k32_ensemble3_ckpt16000_raw
+
+  model:
+    precision: "bf16"
+
+data:
+  model_type: "pi0"
+  robot_type: "bagging_4sku_sm2sm"
+
+  # Inference lookahead H: each frame t is paired with (t, t+k) and scored.
+  # NOTE: this is NOT the same as training-time data.k. At TRAINING, data.k is
+  # the MAX signed offset (strides sampled uniformly from [1, k]); this model
+  # was trained with max-offset 64. At INFERENCE, data.k is the FIXED forward
+  # lookahead. advantage_continuous = E[signed_bin]/half is k-INDEPENDENT
+  # (only the bin distribution matters), so k here only picks which frame to
+  # pair — 32 looks 32 steps (1.6 s @ 20 fps) ahead. Must be <= trained k.
+  k: 32
+
+  # Camera views must match the training config; the processor's
+  # image_keys were saved with these view names in the checkpoint.
+  camera_keys:
+    - face_view
+    - left_wrist_view
+    - right_wrist_view
+
+  prompt: "[task]:Grasp the four items in the checkout area one by one, pass them through the scanner, put them into the paper bag, and finally lift the bag."
+
+  # 9 datasets, 1106 episodes / 1,596,465 frames total.
+  # All are human demonstrations, hence type: sft.
+  # bagging_sku_zzc_0805_dagger contains ONLY the human-takeover segments
+  # (human teleop = expert), so it is scored in the expert pool as well —
+  # this deliberately differs from the open_giftbox convention, where the
+  # DAgger set carried full autonomous rollouts and was tagged ``rollout``.
+  train_data_paths:
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0814
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0715
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0708
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0724
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0805_dagger
+      type: sft
+
+distributed:
+  backend: "nccl"
+  timeout: 3600

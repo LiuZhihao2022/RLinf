@@ -1,0 +1,147 @@
+# Online HG-DAgger on the x2robot (自变量) dual-arm robot.
+#
+# Topology differs from the Franka reference: the robot is NOT a Ray node.
+# The slave arm talks TCP to the bridge env worker, so everything here runs on
+# the single inference box (rollout + env + actor), and `cluster.num_nodes: 1`.
+#
+# Values follow doc 1.2.3 (自变量online dagger支持文档):
+#   action_dim 28 (slave14 + master14 absolute EE pose, no delta)
+#   num_action_chunks 20, num_images_in_input 3
+#   config_name must be a name registered in rlinf openpi dataconfig.
+
+defaults:
+  - env/x2robot_tcp@env.train
+  - env/x2robot_tcp@env.eval
+  - model/pi0@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "x2robot_dagger_openpi"
+    logger_backends: ["tensorboard"]
+  max_epochs: 8000
+  max_steps: -1
+  only_eval: False
+  val_check_interval: -1
+  save_interval: 50
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  dagger:
+    # Nominal only: there is no rollout.expert_model, so the beta-gated model
+    # expert path is short-circuited. The real gate is is_takeover from the
+    # slave (/running_mode == 2), surfaced as intervene_flag.
+    init_beta: 1.0
+    beta_schedule: "exponential"
+    beta_decay: 0.99
+    only_save_expert: True
+  gamma: 0.99
+  update_epoch: 1
+  adv_type: gae
+  loss_type: embodied_dagger
+  replay_buffer:
+    enable_cache: True
+    cache_size: 200
+    min_buffer_size: 4
+    sample_window_size: 200
+    auto_save: False
+
+env:
+  group_name: "EnvGroup"
+  train:
+    rollout_epoch: 1
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 240
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 240
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  recompute_logprobs: False
+  enable_offload: False
+  pipeline_stage_num: 1
+  collect_prev_infos: False
+  model:
+    model_path: ${actor.model.model_path}
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 8
+  global_batch_size: 8
+  seed: 0
+  enable_offload: False
+  model:
+    precision: null
+    # Same checkpoint the bridge serves for inference, and it must carry
+    # assets/{asset_id}/norm_stats.json -- training and inference have to share
+    # one normalization or the policy drifts.
+    model_path: "/path/to/x2robot/cfg_ckpt/global_step_30000"
+    num_action_chunks: 20
+    action_dim: 28
+    add_value_head: False
+    # cfg_model keeps the deployed CFG policy class (guidance dual-pass).
+    # Switch to the plain openpi model only if you want vanilla pi0 SFT.
+    model_type: "cfg_model"
+    openpi:
+      # Must be registered in rlinf/models/embodiment/openpi/dataconfig.
+      # NOTE: pi0_realworld (the Franka default) is NOT registered here.
+      config_name: "clean_table_sm2sm"
+      num_images_in_input: 3
+      train_expert_only: False
+      detach_critic_input: True
+      action_chunk: ${actor.model.num_action_chunks}
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      guidance_type: "positive"
+      positive_only_conditional: true
+    openpi_data:
+      state_history_size: 3
+      state_future_size: 2
+      state_step: 1
+  optim:
+    lr: 1.0e-5
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 4.0
+    warmup_style: "cosine"
+    lr_warmup_steps: 20
+    total_training_steps: 1000
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+critic:
+  use_critic_model: False

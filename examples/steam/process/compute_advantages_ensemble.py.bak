@@ -246,21 +246,6 @@ def _validate_cfg(cfg: DictConfig) -> None:
     train_paths = cfg.data.get("train_data_paths")
     if not train_paths:
         raise ValueError("data.train_data_paths is empty")
-
-    # Fail fast. The same condition is re-checked in the rank-0 aggregation
-    # block, but that runs only AFTER a full inference pass over every dataset
-    # — a misconfigured run would otherwise burn hours before dying. Checked
-    # here so it dies in seconds.
-    if label_mode == "quantile":
-        _has_rollout = any(
-            str(e.get("type", "")).lower() == "rollout" for e in train_paths
-        )
-        if not _has_rollout and expert_quantile is None:
-            raise ValueError(
-                "advantage.label_mode='quantile' with no type='rollout' dataset "
-                "requires advantage.expert_quantile to be set; otherwise there "
-                "is no threshold to label the corpus with."
-            )
     for entry in train_paths:
         ds_type = entry.get("type")
         if ds_type not in ("sft", "rollout"):
@@ -864,42 +849,30 @@ def main(cfg: DictConfig) -> None:
                     for e, d in collected
                     if str(e.type).lower() == "rollout"
                 ]
-                rollout_threshold = None
                 if not rollout_scores:
-                    # sft-only corpus: no rollout pool to threshold against.
-                    # Allowed as long as expert_quantile is set — every entry
-                    # is sft, so rollout_threshold is never read below.
-                    if expert_quantile_cfg is None:
-                        raise ValueError(
-                            "advantage.label_mode='quantile' needs either one "
-                            "type='rollout' dataset (to derive the rollout "
-                            "threshold) or advantage.expert_quantile (to label "
-                            "an sft-only corpus); neither is configured."
-                        )
-                    logger.info(
-                        "No type='rollout' dataset configured → sft-only corpus; "
-                        "labelling by expert_quantile alone, rollout_quantile "
-                        "is ignored."
+                    raise ValueError(
+                        "advantage.label_mode='quantile' requires at least one "
+                        "rollout dataset to derive the rollout threshold; none "
+                        "of the configured train_data_paths has type='rollout'."
                     )
-                else:
-                    combined_rollout = np.concatenate(rollout_scores)
-                    rollout_threshold = float(
-                        np.percentile(
-                            combined_rollout,
-                            (1.0 - float(rollout_quantile_cfg)) * 100.0,
-                        )
+                combined_rollout = np.concatenate(rollout_scores)
+                rollout_threshold = float(
+                    np.percentile(
+                        combined_rollout,
+                        (1.0 - float(rollout_quantile_cfg)) * 100.0,
                     )
-                    logger.info(
-                        "label_mode='quantile' rollout_quantile=%.3f (top %.1f%% "
-                        "of %d rollout samples) → rollout_threshold=%.4f "
-                        "(advantage_continuous range [%.4f, %.4f])",
-                        float(rollout_quantile_cfg),
-                        float(rollout_quantile_cfg) * 100.0,
-                        len(combined_rollout),
-                        rollout_threshold,
-                        float(combined_rollout.min()),
-                        float(combined_rollout.max()),
-                    )
+                )
+                logger.info(
+                    "label_mode='quantile' rollout_quantile=%.3f (top %.1f%% of "
+                    "%d rollout samples) → rollout_threshold=%.4f "
+                    "(advantage_continuous range [%.4f, %.4f])",
+                    float(rollout_quantile_cfg),
+                    float(rollout_quantile_cfg) * 100.0,
+                    len(combined_rollout),
+                    rollout_threshold,
+                    float(combined_rollout.min()),
+                    float(combined_rollout.max()),
+                )
                 if expert_quantile_cfg is not None:
                     sft_scores: list[np.ndarray] = [
                         d["advantage_continuous"].values

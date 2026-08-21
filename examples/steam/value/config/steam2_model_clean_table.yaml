@@ -29,7 +29,7 @@ hydra:
     - file://${oc.env:REPO_PATH}/examples/sft/config/
 
 cluster:
-  num_nodes: 1 # 8卡用1，16卡用2
+  num_nodes: 2 # 8卡用1，16卡用2
   component_placement:
     actor,env,rollout: all
 
@@ -95,7 +95,7 @@ algorithm:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 32 # 8卡用32，16卡用16
+  micro_batch_size: 16 # 8卡用32，16卡用16
   global_batch_size: 512
   seed: 0
 

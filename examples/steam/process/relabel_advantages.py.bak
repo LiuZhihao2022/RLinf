@@ -465,41 +465,29 @@ def main(argv: Optional[list[str]] = None) -> None:
             for _, df, _, dt, _ in loaded
             if dt == "rollout"
         ]
-        rollout_threshold = None
         if not rollout_scores:
-            # sft-only corpus: no rollout pool. Allowed as long as
-            # --expert_quantile is given; rollout_threshold is never read
-            # because every entry resolves to sft.
-            if args.expert_quantile is None:
-                raise ValueError(
-                    "--mode=quantile needs either one rollout dataset or "
-                    "--expert_quantile; every passed dataset resolved to "
-                    "type='sft' and no expert quantile was given."
-                )
-            logger.info(
-                "No rollout dataset among --dataset_paths → sft-only corpus; "
-                "labelling by --expert_quantile alone, --rollout_quantile "
-                "is ignored."
+            raise ValueError(
+                "--mode=quantile requires at least one rollout dataset; every "
+                "passed dataset resolved to type='sft'."
             )
-        else:
-            combined = np.concatenate(rollout_scores)
-            rollout_threshold = float(
-                np.percentile(combined, (1.0 - args.rollout_quantile) * 100.0)
-            )
-            n_positive_rollout = int((combined > rollout_threshold).sum())
-            logger.info(
-                "Mode: quantile rollout_quantile=%.3f (top %.1f%% of %d rollout "
-                "frames) → rollout_threshold=%.4f; %d/%d rollout frames > "
-                "threshold (range=[%.4f, %.4f])",
-                args.rollout_quantile,
-                args.rollout_quantile * 100.0,
-                len(combined),
-                rollout_threshold,
-                n_positive_rollout,
-                len(combined),
-                float(combined.min()),
-                float(combined.max()),
-            )
+        combined = np.concatenate(rollout_scores)
+        rollout_threshold = float(
+            np.percentile(combined, (1.0 - args.rollout_quantile) * 100.0)
+        )
+        n_positive_rollout = int((combined > rollout_threshold).sum())
+        logger.info(
+            "Mode: quantile rollout_quantile=%.3f (top %.1f%% of %d rollout "
+            "frames) → rollout_threshold=%.4f; %d/%d rollout frames > threshold "
+            "(range=[%.4f, %.4f])",
+            args.rollout_quantile,
+            args.rollout_quantile * 100.0,
+            len(combined),
+            rollout_threshold,
+            n_positive_rollout,
+            len(combined),
+            float(combined.min()),
+            float(combined.max()),
+        )
         if args.expert_quantile is not None:
             sft_scores = [
                 df["advantage_continuous"].values

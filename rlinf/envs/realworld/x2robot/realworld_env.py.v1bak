@@ -1,0 +1,114 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Chunk-granular RealWorldEnv for the x2robot TCP bridge.
+
+``RealWorldEnv.chunk_step`` is step-granular: it calls ``step()`` once per
+sub-action and expects a fresh observation each time.  The x2robot slave
+uploads **one observation per chunk** and executes the whole chunk on its own,
+so this subclass performs exactly one TCP round trip per ``chunk_step``.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+from rlinf.envs.realworld.realworld_env import RealWorldEnv
+from rlinf.envs.utils import to_tensor
+
+
+class X2RobotTCPRealWorldEnv(RealWorldEnv):
+    """One ``chunk_step`` == one obs-upload / action-chunk round trip."""
+
+    def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
+        super().__init__(cfg, num_envs, seed_offset, total_num_processes, worker_info)
+        # Downstream code indexes chunk_* with [:, -1] and obs_list[-1]; keeping
+        # the per-chunk length canonical avoids surprising any consumer that
+        # assumes len(obs_list) == num_action_chunks.  In v1 the slave only
+        # uploads one observation per chunk, so the entries are the same frame
+        # repeated -- harmless because nothing trains on rollout-only data yet.
+        # Once the per-step uploader (doc 1.2.5) lands these become real
+        # per-frame records.
+        self.expand_chunk_obs = bool(
+            self.override_cfg.get("expand_chunk_obs", True)
+        )
+        self._last_obs = None
+
+    def reset(self, *, reset_state_ids=None, seed=None, options=None, env_idx=None):
+        obs, infos = super().reset(
+            reset_state_ids=reset_state_ids, seed=seed, options=options, env_idx=env_idx
+        )
+        self._last_obs = obs
+        return obs, infos
+
+    def step(self, actions=None, auto_reset=True):
+        raise NotImplementedError(
+            "x2robot_tcp is chunk-granular; use chunk_step()."
+        )
+
+    def chunk_step(self, chunk_actions):
+        """chunk_actions: ``[num_envs, chunk_steps, action_dim]`` (num_envs == 1)."""
+        if isinstance(chunk_actions, torch.Tensor):
+            chunk_actions = chunk_actions.detach().cpu().numpy()
+        chunk_actions = np.asarray(chunk_actions)
+        chunk_size = chunk_actions.shape[1]
+
+        # num_envs == 1 is asserted by RealWorldEnv.__init__.
+        results = self.env.call("chunk_round_trip", chunk_actions[0])
+        raw_obs, reward, terminated, truncated, info = results[0]
+
+        self._elapsed_steps += 1
+
+        if raw_obs is None:
+            # Slave disconnected -> episode boundary. Reuse the last good
+            # observation so the trajectory can be closed out cleanly.
+            obs = self._last_obs
+            truncated = True
+        else:
+            # _wrap_obs expects the batched (num_envs-leading) layout the
+            # vector env would have produced.
+            batched = {
+                "state": {k: v[None] for k, v in raw_obs["state"].items()},
+                "frames": {k: v[None] for k, v in raw_obs["frames"].items()},
+            }
+            obs = self._wrap_obs(batched)
+            self._last_obs = obs
+
+        n = chunk_size if self.expand_chunk_obs else 1
+        obs_list = [obs] * n
+
+        zeros = torch.zeros((self.num_envs, n), dtype=torch.float32)
+        chunk_rewards = zeros
+        chunk_terminations = torch.zeros((self.num_envs, n), dtype=torch.bool)
+        chunk_truncations = torch.zeros((self.num_envs, n), dtype=torch.bool)
+        chunk_terminations[:, -1] = bool(terminated)
+        chunk_truncations[:, -1] = bool(truncated)
+
+        step_reward = np.zeros(self.num_envs, dtype=np.float32)
+        infos = self._record_metrics(
+            step_reward,
+            np.array([bool(terminated)]),
+            np.zeros(self.num_envs, dtype=bool),  # success_current_step
+            np.zeros(self.num_envs, dtype=bool),  # intervene_flag (v1: rollout only)
+            dict(info),
+        )
+        if self.ignore_terminations:
+            infos["episode"]["success_at_end"] = to_tensor(
+                np.array([bool(terminated)])
+            )
+            chunk_terminations[:, -1] = False
+
+        infos_list = [infos] * n
+        return obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list

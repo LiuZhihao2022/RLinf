@@ -22,10 +22,10 @@ model:
   num_action_chunks: 20
   is_lora: False
   openpi:
-    # config_name: "checkout_chips_sm2sm"
-    # asset_id: "checkout_chips_recap"
-    config_name: "clean_table_sm2sm"
-    asset_id: "clean_table_ygg06170618_steam_sft,clean_table_gqy062306250626_steam_rollout"
+    config_name: "bagging_4sku_sm2sm"
+    asset_id: "bagging_sku_0807_sm2sm"
+    # config_name: "clean_table_sm2sm"
+    # asset_id: "clean_table_ygg06170618_steam_sft,clean_table_gqy062306250626_steam_rollout"
     action_chunk: 20          # = 训练的 num_action_chunks
     num_steps: 4              # pi0.yaml 默认 num_steps=4（训练未覆盖）
     action_env_dim: 28        # = 训练的 action_dim

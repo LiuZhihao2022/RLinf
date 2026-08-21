@@ -1,0 +1,126 @@
+defaults:
+  - model/pi0@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/sft/config/
+
+cluster:
+  num_nodes: 2 # 16卡用2，8卡用1（8卡时把 micro_batch_size 改成 32，保持 global 256）
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "steam_cfg_sft_bagging_4sku"
+    logger_backends: ["wandb"]
+  max_epochs: -1
+  max_steps: 90000  # 总训练步数封顶；每 save_interval=3000 存一次，最终产出 global_step_90000
+  val_check_interval: -1
+  save_interval: 10000
+
+data:
+  num_workers: 8
+  # 从每个数据集读 meta/advantages_{tag}.parquet
+  # 这个 tag 是 relabel_advantages.py 用全局 expert_quantile=0.8 统一重标后的版本，
+  # 不是两半并行跑出来的 ..._raw（后者两半阈值不同，不可用）。
+  advantage_tag: steam_k32_ensemble3_ckpt16000_exp_only
+  balance_dataset_weights: true
+  seed: 42
+  # 9 份全部是人类演示，故均为 sft。
+  # bagging_sku_zzc_0805_dagger 只含人工接管段（人类遥操=专家），同样计入专家池。
+  # 合计 1106 episodes / 1,596,465 帧。
+  train_data_paths:
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0706+0707
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0708
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0714
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0715
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0717
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0724
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0805_dagger
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0813
+      type: "sft"
+      weight: 1.0
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0814
+      type: "sft"
+      weight: 1.0
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16 # 8卡用32，16卡用16
+  global_batch_size: 256
+  seed: 0
+  model:
+    precision: null
+    model_path: "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base_pytorch"
+    model_type: "cfg_model"
+    add_value_head: False
+    action_dim: 28            # x2robot action dim
+    num_action_chunks: 20     # action_horizon=20
+    openpi:
+      # ⚠️ 该 TrainConfig 在 rlinf/models/embodiment/openpi/dataconfig/__init__.py:382
+      # 注册。它的 repo_id 目前仍是从 open_giftbox 复制来的，而 asset_id 默认取
+      # repo_id ⇒ 会加载 open_giftbox 的 norm_stats 来归一化 bagging 数据。
+      # 跑之前必须先加一行显式 asset_id（见对话记录），否则模型静默训错。
+      config_name: "bagging_4sku_sm2sm"
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: False
+      guidance_type: "positive"
+      positive_only_conditional: true
+    openpi_data:
+      state_history_size: 3
+      state_future_size: 2
+      state_step: 1
+  optim:
+    lr: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 5000
+    total_training_steps: 90000
+    min_lr: 0.0
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+critic:
+  use_critic_model: False

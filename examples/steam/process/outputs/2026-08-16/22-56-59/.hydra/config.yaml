@@ -1,0 +1,35 @@
+advantage:
+  value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/steam_sft/bagging_4sku_v1/steam_value_ensemble3/checkpoints/global_step_16000/actor
+  batch_size: 256
+  num_dataloader_workers_per_gpu: 12
+  prefetch_factor: 2
+  label_mode: quantile
+  rollout_quantile: 0.6
+  expert_quantile: 0.8
+  tag: steam_k32_ensemble3_ckpt16000_raw
+  model:
+    precision: bf16
+data:
+  model_type: pi0
+  robot_type: bagging_4sku_sm2sm
+  k: 32
+  camera_keys:
+  - face_view
+  - left_wrist_view
+  - right_wrist_view
+  prompt: '[task]:Grasp the four items in the checkout area one by one, pass them
+    through the scanner, put them into the paper bag, and finally lift the bag.'
+  train_data_paths:
+  - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0814
+    type: sft
+  - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0715
+    type: sft
+  - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0708
+    type: sft
+  - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0724
+    type: sft
+  - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0805_dagger
+    type: sft
+distributed:
+  backend: nccl
+  timeout: 3600

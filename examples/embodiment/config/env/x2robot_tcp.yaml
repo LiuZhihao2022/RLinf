@@ -1,0 +1,60 @@
+# x2robot (自变量) dual-arm slave over the TCP bridge.
+#
+# The bridge is a TCP *server*: the slave's socket2ros client connects to it,
+# so `host`/`port` are what the inference machine binds, and the slave is
+# started with --server-ip <this box>.
+
+env_type: x2robot_tcp
+total_num_envs: null
+auto_reset: True
+# The recording script (a / c / Ctrl+C) owns the episode boundary, not a step
+# budget; max_episode_steps: null hands episode end to the external signal.
+ignore_terminations: True
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+max_steps_per_rollout_epoch: 240
+max_episode_steps: null
+use_spacemouse: False        # takeover comes from the master arm, not a SpaceMouse
+no_gripper: False
+# frames sort to [face_view, left_wrist_view, right_wrist_view]; popping the
+# main key leaves [left, right], which is the order obs_processor expects.
+main_image_key: face_view
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  id: "X2RobotTCPEnv-v1"
+  num_envs: null
+
+override_cfg:
+  # ── inference channel (protocol unchanged; slave needs no edits) ──
+  host: "0.0.0.0"
+  port: 57770
+  # MUST match the slave's --state-history-size/--state-future-size and the
+  # checkpoint's data config, or the assembled (6,32) state is misaligned.
+  state_history_size: 3
+  state_future_size: 2
+  state_step: 1
+  latency_step: null          # null -> state_future_size (deployed default)
+  move_steps: 15
+  policy_mode: "sm2sm"
+  blend_steps: 0
+  image_height: 480
+  image_width: 640
+  task_description: "Clean the dinner table."
+  connect_timeout: null       # wait forever for the robot
+
+  # ── upload channel (always-on; carries the takeover frames) ──
+  # The inference socket is mode-gated and drops on takeover, so this second
+  # channel is what makes online DAgger possible at all.
+  upload_enabled: True
+  upload_port: 57772
+  upload_maxlen: 4000
+
+  manual_episode_control_only: True
+  expand_chunk_obs: True
