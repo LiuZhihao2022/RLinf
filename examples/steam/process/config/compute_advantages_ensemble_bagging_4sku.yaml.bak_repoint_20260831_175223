@@ -76,23 +76,23 @@ data:
   # this deliberately differs from the open_giftbox convention, where the
   # DAgger set carried full autonomous rollouts and was tagged ``rollout``.
   train_data_paths:
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0706+0707
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0706+0707
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0708
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0708
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0714
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0714
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0715
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0715
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0717
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0717
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0724
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0724
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0805_dagger
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0805_dagger
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0813
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0813
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0814
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0814
       type: sft
 
 distributed:

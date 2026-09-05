@@ -1,0 +1,152 @@
+# STEAM 2.0 value model — RoboDojo stack_bowls (仿真).
+#
+# Usage:
+#   bash examples/steam/value/run_steam_sft.sh steam2_model_stack_bowls
+#
+# 与 steam2_model_bagging_4sku.yaml 的差别集中在三处, 每处都在下面注明:
+# 语料规模 (小 39 倍) -> max_steps / save_interval / dagger weight;
+# 相机命名 (LeRobot 标准路径) -> camera_keys;
+# 帧率 25 fps (真机 20) -> k 的时长含义。
+
+defaults:
+  - model/steam@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/sft/config/
+
+cluster:
+  num_nodes: 1 # 8卡用1，16卡用2
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "steam2_stack_bowls_dagger_hinge_seed7_k64"
+    logger_backends: ["wandb"]
+
+  max_epochs: -1
+  # 仿真语料只有 8.9 万 sft 样本 (bagging 是 346 万, 小 39 倍)。按 epoch 对齐
+  # bagging 的 5.9 epoch 只有 1000 步, 不够收敛; 按步数对齐 40000 步则是 229
+  # 个 epoch, 必过拟合。折中取 8000 步 (45.8 epoch), 并把 save_interval 压到
+  # 1000 —— 这个规模下最优步数无法先验确定, 靠 8 个 ckpt 上的诊断指标
+  # (专家节奏 A≈0.5 的校准误差 / 成功失败 AUROC) 挑选, 而不是赌一个步数。
+  max_steps: 8000
+  val_check_interval: -1
+  save_interval: 1000
+
+data:
+  train_data_paths:
+    # 专家演示 100 eps / 44,774 帧 -> 89,348 个 pair 样本。
+    - dataset_path: /mnt/resource/robodojo_dataset/lerobot/robodojo_stack_bowls_sft_ep100
+      type: "sft"
+    # DAgger 175 eps / 91,807 帧; 其中 168 条有子任务标注 (7 条待人工核对,
+    # read_episode_segments 会自动跳过无 subtask_start_frames 的 episode)。
+    # 248 次接管 -> 失败锚点 13,651 + 恢复锚点 28,729 -> 71,109 个样本。
+    #   失败段 [子任务起点, 首次接管) -> fail_loss_mode
+    #   恢复段 [末次接管, 子任务终点) -> 当专家, 正反向对都走 CE
+    #   非接管子任务                  -> 不产训练样本
+    - dataset_path: /mnt/resource/robodojo_dataset/lerobot/robodojo_stack_bowls_dagger_ep175
+      type: "dagger"
+      # 采样概率 ∝ weight × 数据集样本数。这里 dagger (7.1万) 反而比 sft
+      # (8.9万) 还大 —— 与真机相反, 因为仿真接管密集 (1.48 次/条) 而专家
+      # 语料少。weight=1 会让 dagger 占 44%, 远超已验证区间。
+      # 0.08 -> 5.9%, 与 bagging (5.7%) / clean_table (5.9%) 对齐。
+      weight: 0.08
+
+  balance_weights: true
+  seed: 7 # 42 17 7
+  dataset_type: sft
+  fail_loss_mode: hinge
+
+  # RoboDojo 用 LeRobot 标准路径 observation.images.{key};
+  # PairDataset 的 _IMAGE_KEY_ALIASES 会解析裸名, 无需写全路径。
+  camera_keys:
+    - cam_high
+    - cam_left_wrist
+    - cam_right_wrist
+  # 与真机同为 64, 但 25 fps 下是 2.56 s (真机 20 fps 是 3.2 s)。
+  # 相对阶段时长的比例仍接近: 仿真 64/112 = 0.57, 真机 64/99 = 0.65。
+  # 推理端保持 H = k/2 = 32, 专家节奏的 A = H/k = 0.5 校准关系不变。
+  k: 64
+  only_success: true
+
+  min_episode_length: null
+
+  train_num_workers: 8
+  eval_num_workers: 4
+  prefetch_factor: 4
+  persistent_workers: false
+  pin_memory: false
+  do_augment: false
+
+algorithm:
+  adv_type: gae   # unused here — retained for config shape parity
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32 # 8卡用32，16卡用16
+  global_batch_size: 512
+  seed: 0
+
+  model:
+    precision: bf16
+    fusion_hidden_dim: 512
+    dropout: 0.1
+    label_smoothing: 0.05
+    num_frames_per_pair: 2
+    num_bins: 32
+    vision_repo_id: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/siglip2-so400m-patch14-224"
+    language_repo_id: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/gemma-3-270m"
+    tokenizer_path: "/mnt/public/guqiuyi/RLinf_active/pretrained_models/gemma-3-270m"
+    freeze_vision_encoder: false
+    freeze_language_model: false
+    # 仿真状态是 14 维关节空间 (真机 28 维末端+主臂); max_state_dim 是上限,
+    # 且 include_state_in_prompt=false 时状态根本不进 prompt, 无需改。
+    include_state_in_prompt: false
+    max_state_dim: 32
+    state_discretization_bins: 256
+    max_token_len: 200
+    ensemble_size: 1
+    ensemble_head_seed_base: 0
+    use_gradient_checkpointing: true
+
+  optim:
+    lr: 5.0e-5
+    value_lr: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-5
+    clip_grad: 10.0
+    lr_scheduler: "constant"
+    # warmup 按 max_steps 等比缩放 (bagging 500/40000 = 1.25%)
+    lr_warmup_steps: 100
+    total_training_steps: 8000
+    min_lr: 1.0e-6
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: true
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: bf16
+      reduce_dtype: fp32
+      buffer_dtype: fp32
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

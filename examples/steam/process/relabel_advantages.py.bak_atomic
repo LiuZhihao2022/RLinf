@@ -107,33 +107,6 @@ def _read_mixture_config(dataset_path: Path) -> dict[str, Any]:
     return loaded
 
 
-def _atomic_write_yaml(path: Path, data: dict[str, Any]) -> None:
-    """Write ``data`` to ``path`` even when the existing file is not writable.
-
-    Shared dataset dirs commonly hold a root-owned ``mixture_config.yaml``
-    inside a group-writable ``meta/``: ``open(path, "w")`` is denied, but
-    replacing the directory entry is not. Write a sibling temp file and
-    ``os.replace`` it -- atomic, so a crash mid-write cannot leave a truncated
-    config behind. Note this makes the caller the new file's owner.
-    """
-    import os
-    import tempfile
-
-    fd, tmp = tempfile.mkstemp(
-        dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
-    )
-    try:
-        with os.fdopen(fd, "w") as f:
-            yaml.safe_dump(data, f, sort_keys=False)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-
-
 def _write_mixture_config_tag(
     dataset_path: Path, tag: str, new_entry: dict[str, Any]
 ) -> Path:
@@ -146,7 +119,8 @@ def _write_mixture_config_tag(
     tags[str(tag)] = new_entry
     existing["tags"] = tags
     p.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write_yaml(p, existing)
+    with open(p, "w") as f:
+        yaml.safe_dump(existing, f, sort_keys=False)
     return p
 
 

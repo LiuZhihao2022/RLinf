@@ -173,12 +173,6 @@ class OpenPi0Config(Pi0Config):
     unconditional_prob: float = 0.3
     guidance_type: str = "positive"
     positive_only_conditional: bool = False
-    # "cfgrl": advantage 是 bool 标签, 走条件化路由(默认, 完全兼容旧行为)。
-    # "dwbc":  Difficulty-Weighted BC(proposal M11)。advantage 张量装的是
-    #          compute_dwbc_weights.py 离线算好的每帧权重
-    #          w = (1 + d_s/d_avg) * max(A, 0), 已归一化到全语料均值 1,
-    #          loss 是普通加权平均;不做任何条件化, 推理时就是普通 pi0。
-    algorithm: str = "cfgrl"
 
     def __post_init__(self):
         if self.guidance_type not in _VALID_GUIDANCE_TYPES:
@@ -193,10 +187,6 @@ class OpenPi0Config(Pi0Config):
         if not isinstance(self.num_steps, int) or self.num_steps <= 0:
             raise ValueError(
                 f"num_steps must be a positive integer, got {self.num_steps}"
-            )
-        if self.algorithm not in ("cfgrl", "dwbc"):
-            raise ValueError(
-                f"algorithm must be 'cfgrl' or 'dwbc', got '{self.algorithm}'"
             )
 
 
@@ -381,19 +371,8 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
         device,
         time=None,
         noise=None,
-        sample_weights=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute flow loss and detached per-sample loss for a language route.
-
-        ``sample_weights`` ([B], optional): per-sample loss weights. They are
-        pre-normalized OFFLINE to corpus mean 1 (compute_dwbc_weights.py), so
-        the weighted loss is a plain mean -- deliberately NOT divided by the
-        batch's sum(w): micro-batches are small (16), their sum(w) is noisy,
-        and a per-batch denominator would give high- and low-weight
-        micro-batches equal say. A fixed normalizer keeps the estimator
-        faithful to M11's corpus-level sum(w*l)/sum(w) and the effective lr
-        comparable to vanilla BC.
-        """
+        """Compute flow loss and detached per-sample loss for a language route."""
         images = [img.to(device) for img in images]
         img_masks = [img_mask.to(device) for img_mask in img_masks]
         state = state.to(device)
@@ -460,13 +439,7 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
         per_element_loss = F.mse_loss(u_t, v_t, reduction="none")
-        if sample_weights is not None:
-            w = sample_weights.to(
-                dtype=per_element_loss.dtype, device=per_element_loss.device
-            ).view(-1)
-            flow_loss = (per_element_loss.mean(dim=(-1, -2)) * w).mean()
-        else:
-            flow_loss = per_element_loss.mean()
+        flow_loss = per_element_loss.mean()
         per_sample_loss = per_element_loss.detach().mean(dim=(-1, -2))
         return flow_loss, per_sample_loss
 
@@ -522,19 +495,6 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
                 "Please run compute_advantages.py first to generate "
                 "meta/advantages.parquet for your dataset."
             )
-        if self.config.algorithm == "dwbc":
-            return self._forward_dwbc(
-                images=images,
-                img_masks=img_masks,
-                state=state,
-                lang_tokens=lang_tokens,
-                lang_masks=lang_masks,
-                actions=actions,
-                weights=advantage,
-                device=device,
-                **kwargs,
-            )
-
         advantage = advantage.to(dtype=torch.bool)
         routing = compute_cfg_routing_masks(
             advantage,
@@ -638,55 +598,6 @@ class OpenPi0ForCFGActionPrediction(BasePolicy, PI0Pytorch):
             ),
         }
 
-        return flow_loss, metrics
-
-    def _forward_dwbc(
-        self,
-        *,
-        images,
-        img_masks,
-        state,
-        lang_tokens,
-        lang_masks,
-        actions,
-        weights,
-        device,
-        **kwargs,
-    ):
-        """Difficulty-Weighted BC (proposal M11).
-
-        The tensor arriving on the 'advantage' plumbing carries the
-        PRE-COMPUTED per-frame weight, not a label (see the worker's
-        weight_tag path). No conditioning: the plain prompt tokens are used
-        for every sample, so at inference the policy is an ordinary pi0 --
-        the guidance prompts tokenized upstream are simply ignored.
-        """
-        w = weights.to(device=device, dtype=torch.float32).view(-1)
-        actions = actions.to(device, dtype=torch.float32)
-        time = kwargs.get("time")
-        if time is None:
-            time = self.sample_time(actions.shape[0], device)
-        noise = kwargs.get("noise")
-        if noise is None:
-            noise = self.sample_noise(actions.shape, device)
-
-        flow_loss, per_sample_loss = self._compute_flow_losses(
-            images=images,
-            img_masks=img_masks,
-            state=state,
-            actions=actions,
-            lang_tokens=lang_tokens,
-            lang_masks=lang_masks,
-            device=device,
-            time=time,
-            noise=noise,
-            sample_weights=w,
-        )
-        metrics = {
-            "dwbc_weight_mean": w.mean().item(),
-            "dwbc_weight_zero_frac": (w == 0).float().mean().item(),
-            "dwbc_unweighted_loss": per_sample_loss.mean().item(),
-        }
         return flow_loss, metrics
 
     def obs_processor(self, env_obs):

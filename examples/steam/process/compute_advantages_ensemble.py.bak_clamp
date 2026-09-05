@@ -495,47 +495,6 @@ def _append_missing_terminal_rows(
     return combined, len(missing_terminal_rows)
 
 
-def _reset_degenerate_rows(
-    df: pd.DataFrame,
-    *,
-    anchors: list[tuple[int, int]],
-    member_count: int,
-) -> tuple[pd.DataFrame, int]:
-    """Neutralise frames that sit exactly on a human takeover.
-
-    Their autonomous segment holds no partner frame, so whatever the model
-    scored came from a pair straddling the seam into the human recovery.
-    Overwrite with the same defaults :func:`_build_terminal_frame_rows` uses.
-    """
-    if not anchors or len(df) == 0:
-        return df, 0
-    row_keys = pd.MultiIndex.from_arrays(
-        [df["episode_index"].astype(int), df["frame_index"].astype(int)]
-    )
-    mask = row_keys.isin(pd.MultiIndex.from_tuples(anchors))
-    hits = int(mask.sum())
-    if hits == 0:
-        return df, 0
-    for column in (
-        "ensemble_signed_score",
-        "p_progress_mean",
-        "p_progress_min",
-        "p_progress_variance",
-        "expected_stride_normalized",
-        "entropy_aggregated",
-        "entropy_member_mean",
-        "entropy_member_variance",
-    ):
-        if column in df.columns:
-            df.loc[mask, column] = 0.0
-    if "member_values" in df.columns:
-        zero_members = [0.0] * max(1, int(member_count))
-        df.loc[mask, "member_values"] = pd.Series(
-            [list(zero_members)] * hits, index=df.index[mask]
-        )
-    return df, hits
-
-
 def _run_inference_for_dataset(
     *,
     model: EnsembleSteamCriticModel,
@@ -552,17 +511,7 @@ def _run_inference_for_dataset(
         k=int(cfg.data.k),
         prompt=cfg.data.get("prompt", None),
         dataset_type=dataset_entry.type,
-        clamp_at_takeover=bool(cfg.data.get("clamp_at_takeover", False)),
     )
-    if dataset.clamp_at_takeover and rank == 0:
-        # Log even when zero, so a clamp that silently no-ops (missing
-        # takeover_frames in meta/episodes.jsonl) is visible in the run log
-        # rather than passing for a completed relabel.
-        logger.info(
-            "Takeover clamp ON for %s: %d episodes carry takeover boundaries",
-            dataset_entry.dataset_path,
-            len(dataset._takeover_boundaries),
-        )
 
     collator = BinaryPairDataCollator(
         processor=model.members[0].processor,
@@ -646,18 +595,6 @@ def _run_inference_for_dataset(
             logger.info(
                 "Appended %d terminal frames with default-negative scores for %s",
                 num_appended,
-                dataset_entry.dataset_path,
-            )
-        df, num_reset = _reset_degenerate_rows(
-            df,
-            anchors=dataset.degenerate_anchors(),
-            member_count=int(model.config.ensemble_size),
-        )
-        if num_reset > 0:
-            logger.info(
-                "Reset %d takeover-anchored frames to default-negative scores "
-                "for %s",
-                num_reset,
                 dataset_entry.dataset_path,
             )
     return df

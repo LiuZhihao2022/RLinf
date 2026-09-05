@@ -367,27 +367,7 @@ class _LeRobotSource(TrajectorySource):
 
         video_keys = set(getattr(self.meta, "video_keys", []))
         camera_keys = tuple(camera_keys)
-        # Camera keys arrive plain ("face_view", "cam_high"), but a dataset may
-        # store them under any of the standard LeRobot paths -- x2robot uses the
-        # bare name, RoboDojo uses "observation.images.<name>". Resolve each one
-        # through the same alias templates used elsewhere in this class, so both
-        # conventions take the batched decode path instead of silently falling
-        # back to decoding every camera twice per pair.
-        requested_video_keys = []
-        for key in camera_keys:
-            resolved = next(
-                (
-                    candidate
-                    for candidate in (
-                        template.format(key=key) for template in _IMAGE_KEY_ALIASES
-                    )
-                    if candidate in video_keys
-                ),
-                None,
-            )
-            if resolved is None:
-                break
-            requested_video_keys.append(resolved)
+        requested_video_keys = [key for key in camera_keys if key in video_keys]
         if len(requested_video_keys) != len(camera_keys):
             return (
                 self.get_raw_sample(episode, frame_t),
@@ -521,11 +501,6 @@ class _BasePairDataset(Dataset):
         ``t_plus_k`` uses the boundary clamp: when ``t + k`` overruns the
         episode the second slot collapses to the last frame ``T - 1`` (stride
         degrades to ``T - 1 - t < k``).
-
-        When the subclass sets ``_takeover_boundaries`` (only
-        :class:`BinaryPairInferenceDataset`, under ``clamp_at_takeover``) the
-        same collapse also applies at the first takeover at or after ``t``, so
-        a pair never straddles the autonomous/human seam.
         """
         if pair_position < 0 or pair_position >= self._num_pair_positions:
             raise IndexError(pair_position)
@@ -537,21 +512,7 @@ class _BasePairDataset(Dataset):
         )
         episode = int(self._eligible[episode_slot])
         t = int(pair_position - prev_episode_end)
-        episode_length = self._source.episode_length(episode)
-        t_plus_k = min(t + self.k, episode_length - 1)
-        bounds = getattr(self, "_takeover_boundaries", None)
-        if bounds:
-            episode_bounds = bounds.get(episode)
-            if episode_bounds is not None and len(episode_bounds):
-                pos = int(np.searchsorted(episode_bounds, t, side="left"))
-                if pos < len(episode_bounds):
-                    t_plus_k = min(t_plus_k, int(episode_bounds[pos]))
-                if t_plus_k <= t:
-                    # Anchor sits exactly on a takeover: its own autonomous
-                    # segment holds no partner. Load (t, t+1) so batch shapes
-                    # stay valid; the row is overwritten with default-negative
-                    # scores downstream (see ``degenerate_anchors``).
-                    t_plus_k = min(t + 1, episode_length - 1)
+        t_plus_k = min(t + self.k, self._source.episode_length(episode) - 1)
         return episode, t, t_plus_k
 
     def _load_views(
@@ -1065,35 +1026,6 @@ def read_episode_segments(dataset_path: str) -> dict[int, dict]:
     return out
 
 
-def read_episode_takeovers(dataset_path: str) -> dict[int, list[int]]:
-    """Read per-episode human-takeover frames from ``meta/episodes.jsonl``.
-
-    Unlike :func:`read_episode_segments` this does not require usable
-    ``subtask_start_frames``: the takeover moments alone are enough to clamp
-    inference pairs at the autonomous/human boundary. Returns ``{}`` when the
-    file is absent or carries no ``takeover_frames`` (every plain SFT
-    dataset), which leaves the caller's clamp inert.
-    """
-    import json
-
-    path = os.path.join(dataset_path, "meta", "episodes.jsonl")
-    if not os.path.exists(path):
-        return {}
-    out: dict[int, list[int]] = {}
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            frames = sorted(
-                int(v) for v in (rec.get("takeover_frames") or []) if v is not None
-            )
-            if frames:
-                out[int(rec["episode_index"])] = frames
-    return out
-
-
 class DaggerPairDataset(_BasePairDataset):
     """Frame pairs from DAgger takeover segments for the offset predictor.
 
@@ -1559,7 +1491,6 @@ class BinaryPairInferenceDataset(_BasePairDataset):
         prompt: Optional[str],
         dataset_type: str,
         min_episode_length: Optional[int] = None,
-        clamp_at_takeover: bool = False,
     ) -> None:
         if dataset_type not in ("sft", "rollout"):
             raise ValueError(
@@ -1602,32 +1533,8 @@ class BinaryPairInferenceDataset(_BasePairDataset):
                 f"{self._min_episode_length} (dataset has {total_eps} episodes)."
             )
 
-        self.clamp_at_takeover = bool(clamp_at_takeover)
-        self._takeover_boundaries: dict[int, np.ndarray] = {}
-        if self.clamp_at_takeover:
-            for ep, frames in read_episode_takeovers(dataset_path).items():
-                last_anchor = self._source.episode_length(ep) - 1
-                kept = sorted({f for f in frames if 0 <= f <= last_anchor})
-                if kept:
-                    self._takeover_boundaries[ep] = np.asarray(kept, dtype=np.int64)
-
         # One anchor per t in [0, T - 2]; total = sum(T_ep - 1).
         self._init_anchor_index()
-
-    def degenerate_anchors(self) -> list[tuple[int, int]]:
-        """Anchors sitting exactly on a takeover, as ``(episode, frame)``.
-
-        Such a frame has no partner inside its own autonomous segment, so the
-        pair actually loaded crosses the seam by one frame purely to keep
-        batch shapes valid. The caller overwrites these rows with the same
-        default-negative values a terminal frame gets. Empty unless
-        ``clamp_at_takeover`` is on.
-        """
-        out: list[tuple[int, int]] = []
-        for ep, bounds in self._takeover_boundaries.items():
-            last_anchor = self._source.episode_length(ep) - 2
-            out.extend((int(ep), int(b)) for b in bounds if b <= last_anchor)
-        return sorted(out)
 
         logger.info(
             "BinaryPairInferenceDataset: source=%s, episodes=%d, k=%d, "

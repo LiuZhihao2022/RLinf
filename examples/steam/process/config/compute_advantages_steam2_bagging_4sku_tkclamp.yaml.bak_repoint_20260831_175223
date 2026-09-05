@@ -1,0 +1,148 @@
+# STEAM 2.0 advantage labelling for bagging_4sku -- TAKEOVER-CLAMPED rerun.
+#
+# Only difference from compute_advantages_steam2_bagging_4sku.yaml:
+# data.clamp_at_takeover: true. Without it a frame t in the 1.6 s before a human
+# takeover is paired with t+32, which lands INSIDE the human recovery -- the
+# model sees real progress and scores the failing frame positive. That is
+# lookahead leakage: it rewards exactly the states DAgger was collected to
+# punish. With the clamp, the pair collapses to (t, next_takeover), so the
+# lookahead never crosses the autonomous/human seam.
+#
+# Scope: only bagging_sku_fty0713_steam_dagger carries takeover_frames, so the
+# clamp is provably inert on the 12 SFT sets (verified: 0 anchors shortened,
+# identical resolution). They are re-scored anyway because label_mode: quantile
+# pools frames across datasets -- running the DAgger set alone would leave the
+# expert pool empty and misplace both thresholds.
+#
+# Effect on the DAgger set: 2595 / 195880 anchors (1.32%) get a shortened
+# stride; the 82 frames sitting exactly ON a takeover have no in-segment
+# partner at all and are written as default-negative, like an episode's
+# terminal frame.
+#
+# Difference from the STEAM 1.0 config next to this one: the value model was
+# trained WITH the DAgger takeover segments (failure segment under the hinge
+# loss, recovery segment as expert), so it has actually seen "entering failure"
+# and "recovering from failure" rather than only expert demonstrations.
+#
+# M = 1 (no ensemble). The checkpoint's config.json carries ensemble_size: 1 and
+# the labelling script reads it from there -- this yaml cannot override it.
+# Rationale (proposal 0.1 / decision 4): on 106 real takeovers the three
+# STEAM 1.0 members produced near-identical estimates on failure frames
+# (0.249 / 0.255 / 0.252) -- they share one blind spot, so min aggregation
+# bought only +0.003 AUROC of failure discrimination and was a uniform shift
+# the quantile threshold absorbs anyway. The paper's "members diverge out of
+# distribution" premise did not hold on real failure states.
+#   Caveat kept honest: that evidence is about DISCRIMINATION. The paper's
+#   M=1 -> M=3 gain (+19.6) was downstream success rate, so if ensemble is to
+#   be declared unnecessary, a downstream run still has to show it.
+#
+# Usage (8 GPUs):
+#   bash examples/steam/process/run_compute_advantages_ensemble.sh \
+#       compute_advantages_steam2_bagging_4sku_tkclamp --nproc 8
+
+advantage:
+  # seed 7, 24000 steps on 12 sft + 1 dagger (dagger sampled at 5.7%), trained
+  # AFTER the 2026-08-30 relabel of the DAgger meta: the stage 12->13 boundary
+  # moved 7.1 s earlier on average and the stage-13 takeover stamps 2.3 s
+  # earlier, which shifted ~3500 frames out of the failure segment and into
+  # the recovery segment. Run health at the stop: loss 1.35 (collapse would be
+  # ln 32 = 3.47), accuracy 0.54 (collapse 0.031), grad_norm rebounded 4.2 ->
+  # 8.6 -> 6.3 rather than decaying.
+  value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/steam_sft/steam2_model_bagging_4sku-20260830-21:33:01/steam2_bagging_4sku_dagger_hinge_seed7_k64_relabel/checkpoints/global_step_24000/actor
+
+  batch_size: 256
+  num_dataloader_workers_per_gpu: 12
+  prefetch_factor: 2
+
+  label_mode: quantile
+  # rollout pool: the DAgger set (see the type: rollout note below).
+  # Kept at 0.6. The 0.3 cut was introduced when the labels came from the value
+  # model trained on the OLD DAgger meta, where 24.7% of failure-segment frames
+  # still scored positive at 0.6. After the 2026-08-30 relabel and retrain the
+  # model separates the two on its own: at 0.6 only 0.9% of the frames in the
+  # 1.6 s before a takeover are positive (was 3.5% even at 0.3) and 98.2% of the
+  # 1.6 s after are (was 90.5%). Tightening further would halve the positive
+  # pool for no measurable gain.
+  rollout_quantile: 0.6
+  # expert pool: the 12 demonstration sets, scored independently of the above.
+  expert_quantile: 0.8
+
+  tag: steam2_k32_dagger_hinge_ckpt24000_relabel_tkclamp
+
+  model:
+    precision: "bf16"
+
+data:
+  model_type: "pi0"
+  robot_type: "bagging_4sku_sm2sm"
+
+  # Inference lookahead: each frame t is paired with (t, t+k).
+  # NOT the same as the training-time data.k, which is the MAX sampled stride
+  # (uniform in [1, k]); this model was trained with max-stride 64. Project
+  # convention is train k=64 / label k=32.
+  k: 32
+
+  # Clamp the lookahead at the first human takeover at or after t, so a pair
+  # never straddles the autonomous/human seam. Reads takeover_frames from each
+  # dataset's meta/episodes.jsonl; datasets without that key are unaffected.
+  clamp_at_takeover: true
+
+  camera_keys:
+    - face_view
+    - left_wrist_view
+    - right_wrist_view
+
+  prompt: "[task]:Grasp the four items in the checkout area one by one, pass them through the scanner, put them into the paper bag, and finally lift the bag."
+
+  # Same corpus the value model was trained on: 12 expert sets + 1 DAgger set.
+  train_data_paths:
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0706+0707
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0708_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0714_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0715_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0717_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0724_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0730_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    # Despite the name this one holds takeover segments only, i.e. pure human
+    # teleop, so it is expert data and goes in the expert pool.
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0805_dagger
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0810
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0811_1_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0813_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0814_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    # type: rollout, not dagger -- deliberate, matching the open_giftbox run.
+    # At LABELLING time the whole DAgger set goes through the rollout pool's
+    # quantile; "dagger" is a TRAINING-side type only. Routing the recovery
+    # segment into the expert pool instead is an open item (proposal 7.1) and
+    # needs segment-level types, which the script does not support yet.
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty0713_steam_dagger
+      robot_type: "bagging_4sku_sm2sm"
+      type: rollout
+
+distributed:
+  backend: "nccl"
+  timeout: 3600

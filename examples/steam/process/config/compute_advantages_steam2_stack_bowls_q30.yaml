@@ -1,0 +1,69 @@
+# v2:给 sft + dagger + rollout 三份数据打 advantage,rollout 池(dagger+rollout
+# 合并排序)的 top 分位数从 0.6 收紧到 0.3。连续值与 v1 相同(同一 value model),
+# 只有 bool 标签不同。
+#
+# Usage:
+#   cd examples/steam/process
+#   bash run_compute_advantages_ensemble.sh compute_advantages_steam2_stack_bowls --nproc 8
+#
+# 换 ckpt 只改 value_checkpoint 与 tag 两处, 或命令行覆盖:
+#   ... advantage.value_checkpoint=.../global_step_4000/actor \
+#       advantage.tag=steam2_stack_bowls_k32_ckpt4000
+
+advantage:
+  # 单模型(ensemble_size=1), 不是 ensemble —— ckpt 里的 config.json 决定。
+  value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/steam_sft/steam2_model_stack_bowls-20260902-20:49:52/steam2_stack_bowls_dagger_hinge_seed7_k64/checkpoints/global_step_8000/actor
+
+  batch_size: 512          # 单模型每样本只前向一次, 比 ensemble 的 256 可翻倍
+  num_dataloader_workers_per_gpu: 12
+  prefetch_factor: 2
+
+  label_mode: quantile
+  # dagger+rollout 两份 type:rollout 数据 pool 到一起取 top 30%(v1 是 0.6)
+  rollout_quantile: 0.3
+  expert_quantile: 0.8
+
+  tag: steam2_sb_k32_ckpt8000_q30
+
+  model:
+    precision: "bf16"
+
+data:
+  # 这两个字段在 SteamCriticModel.from_checkpoint 里被 `del` 掉了, 不起作用,
+  # 保留只为与其他配置结构一致。
+  model_type: "pi0"
+  robot_type: "robodojo_arx_x5"
+
+  # 推理前瞻 H。训练时 data.k=64 是**最大**有符号偏移(stride 从 [1,64] 均匀采),
+  # 推理时 data.k 是**固定**前瞻。取 32 = 训练 k 的一半, 维持
+  # 「专家节奏 ⇒ A = H/K = 0.5」这个校准关系。25 fps 下是 1.28 s。
+  k: 32
+
+  camera_keys:
+    - cam_high
+    - cam_left_wrist
+    - cam_right_wrist
+
+  # 不设 prompt: BinaryPairInferenceDataset 会回落到数据集自己的
+  # meta/tasks.jsonl("Stack the three bowls together."), 与训练时读到的完全一致。
+
+  # 接管处截断: 让 (t, t+k) 这一对不跨越自主/人工的接缝。
+  # bagging 上的消融显示这一步把 AUROC 从 0.608 提到 0.628。
+  clamp_at_takeover: true
+
+  train_data_paths:
+    # 纯专家演示 -> expert 池, 用 expert_quantile。
+    - dataset_path: /mnt/resource/robodojo_dataset/lerobot/robodojo_stack_bowls_sft_ep100
+      type: sft
+    # DAgger 是完整 episode(策略自主 + 人接管), 不是纯人工段, 所以按
+    # open_giftbox 的约定进 rollout 池独立算阈值 —— 这与 bagging 不同,
+    # bagging 那份 DAgger 只含人接管段, 才当 sft。
+    - dataset_path: /mnt/resource/robodojo_dataset/lerobot/robodojo_stack_bowls_dagger_ep175
+      type: rollout
+    # BC(pi0 jax 29999)的纯自主 rollout,19 成 31 败,50 eps —— 难度轴 d_s 的第二来源
+    - dataset_path: /mnt/resource/robodojo_dataset/lerobot/robodojo_stack_bowls_rollout_seed0_ep50
+      type: rollout
+
+distributed:
+  backend: "nccl"
+  timeout: 3600

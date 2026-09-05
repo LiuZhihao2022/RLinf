@@ -367,27 +367,7 @@ class _LeRobotSource(TrajectorySource):
 
         video_keys = set(getattr(self.meta, "video_keys", []))
         camera_keys = tuple(camera_keys)
-        # Camera keys arrive plain ("face_view", "cam_high"), but a dataset may
-        # store them under any of the standard LeRobot paths -- x2robot uses the
-        # bare name, RoboDojo uses "observation.images.<name>". Resolve each one
-        # through the same alias templates used elsewhere in this class, so both
-        # conventions take the batched decode path instead of silently falling
-        # back to decoding every camera twice per pair.
-        requested_video_keys = []
-        for key in camera_keys:
-            resolved = next(
-                (
-                    candidate
-                    for candidate in (
-                        template.format(key=key) for template in _IMAGE_KEY_ALIASES
-                    )
-                    if candidate in video_keys
-                ),
-                None,
-            )
-            if resolved is None:
-                break
-            requested_video_keys.append(resolved)
+        requested_video_keys = [key for key in camera_keys if key in video_keys]
         if len(requested_video_keys) != len(camera_keys):
             return (
                 self.get_raw_sample(episode, frame_t),

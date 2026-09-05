@@ -41,9 +41,6 @@ from rlinf.models.embodiment.openpi.dataconfig.franka_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.gsenv_dataconfig import (
     LeRobotGSEnvDataConfig,
 )
-from rlinf.models.embodiment.openpi.dataconfig.robodojo_dataconfig import (
-    LeRobotRoboDojoArxX5DataConfig,
-)
 from rlinf.models.embodiment.openpi.dataconfig.isaaclab_dataconfig import (
     LeRobotIsaacLabStackCubeDataConfig,
 )
@@ -538,38 +535,6 @@ _CONFIGS = [
             "checkpoints/jax/pi05_base/params"
         ),
         pytorch_weight_path="checkpoints/torch/pi05_base",
-    ),
-    # ------------------------------------------------------------------
-    # RoboDojo (仿真, ARX X5 双臂, 关节空间 14 维)
-    #
-    # 与真机 *_sm2sm 配置的差别: 关节空间而非末端、无主臂、无 state history、
-    # action_horizon=50(真机 20)。名字**不含** sm2sm/s2s 等子串 —— 那些子串会
-    # 让 openpi_action_model.obs_processor 走真机的 env_obs 分支(只影响在线
-    # rollout, 离线 CFGRL 训练不经过, 但避开更干净)。
-    #
-    # repo_id 只用于 asset_id 的默认值: norm_stats 从 model_path 下的
-    # {asset_id}/norm_stats.json 读, 所以这里必须与 openpi 侧算 norm stats 时
-    # 的 repo_id 一致。norm stats 由 openpi 仓库的
-    #   uv run scripts/compute_norm_stats.py --config-name pi0_robodojo_stack_bowls_sft
-    # 产出, 需拷到 checkpoints/pi0_base_pytorch/robodojo_stack_bowls_sft_ep100/。
-    TrainConfig(
-        name="robodojo_stack_bowls",
-        model=pi0_config.Pi0Config(action_horizon=50),
-        data=LeRobotRoboDojoArxX5DataConfig(
-            repo_id="robodojo_stack_bowls_sft_ep100",
-            # 必须显式给 asset_id。get_openpi_config 只在**调用方传了 repo_id
-            # 覆盖**时才把 asset_id 兜底成 repo_id;直接按 name 取配置时它是
-            # None,而 openpi/__init__.py 在 load_norm_stats 前会
-            # raise ValueError("Asset id is required to load norm stats.")。
-            assets=AssetsConfig(asset_id="robodojo_stack_bowls_sft_ep100"),
-            action_dim=14,
-            use_delta_joint_actions=True,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader(
-            "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base/params"
-        ),
-        batch_size=128,
-        exp_name="robodojo_stack_bowls_pi0_joint_a50",
     ),
 ]
 

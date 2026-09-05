@@ -1,3 +1,13 @@
+# NOTE — 这是「B」半份，与 partA 同时在另一台 8 卡机上跑。
+#
+# ⚠️ tag 是 steam_k32_ensemble3_ckpt16000_raw（raw = 临时）。两半各自算出的 expert_quantile
+# 阈值只覆盖自己那部分数据，**不是全局阈值**，因此 bool 列不可直接使用。
+# 两半都跑完后必须执行 relabel_advantages.py，把 9 个数据集的
+# advantage_continuous 汇总重算一次全局阈值，产出最终 tag。
+# 命令见 §跑法（相邻的 README 或对话记录）。
+#
+# 本半份：5 个数据集，每卡 386 个 batch，约 52 分钟。
+
 # Advantage computation using the STEAM ensemble value model — bagging_4sku.
 #
 # The label written per frame is ``True`` iff the ensemble-aggregated
@@ -42,7 +52,7 @@ advantage:
   # lower-scoring dataset will receive proportionally fewer positives.
   expert_quantile: 0.8
 
-  tag: steam_k32_ensemble3_ckpt16000_exp_only
+  tag: steam_k32_ensemble3_ckpt16000_raw
 
   model:
     precision: "bf16"
@@ -76,23 +86,15 @@ data:
   # this deliberately differs from the open_giftbox convention, where the
   # DAgger set carried full autonomous rollouts and was tagged ``rollout``.
   train_data_paths:
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0706+0707
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0814
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0708
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0715
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0714
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0708
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0715
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0724
       type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0717
-      type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0724
-      type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0805_dagger
-      type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0813
-      type: sft
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0814
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0805_dagger
       type: sft
 
 distributed:

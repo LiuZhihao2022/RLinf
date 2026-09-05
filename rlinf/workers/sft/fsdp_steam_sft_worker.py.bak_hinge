@@ -683,17 +683,6 @@ class FSDPSteamSftWorker(FSDPModelManager, Worker):
             metrics["progress_value_mean"] = float(
                 result.progress_values.detach().float().mean().item()
             )
-        # 失败段诊断。没有 hinge 样本的 micro batch 直接不写这些 key ——
-        # _mean_metrics 按 key 独立聚合, 缺席不会污染其他指标。
-        for field, name in (
-            ("hinge_loss", "hinge_loss"),
-            ("hinge_active_frac", "hinge_active_frac"),
-            ("hinge_sample_frac", "hinge_sample_frac"),
-            ("ce_loss", "ce_loss"),
-        ):
-            value = getattr(result, field, None)
-            if value is not None:
-                metrics[name] = float(value.detach().float().item())
         return metrics
 
     def _log_training_batch_diagnostics_once(

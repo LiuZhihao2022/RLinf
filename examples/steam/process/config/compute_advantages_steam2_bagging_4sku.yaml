@@ -1,0 +1,111 @@
+# STEAM 2.0 advantage labelling for bagging_4sku.
+#
+# Difference from the STEAM 1.0 config next to this one: the value model was
+# trained WITH the DAgger takeover segments (failure segment under the hinge
+# loss, recovery segment as expert), so it has actually seen "entering failure"
+# and "recovering from failure" rather than only expert demonstrations.
+#
+# M = 1 (no ensemble). The checkpoint's config.json carries ensemble_size: 1 and
+# the labelling script reads it from there -- this yaml cannot override it.
+# Rationale (proposal 0.1 / decision 4): on 106 real takeovers the three
+# STEAM 1.0 members produced near-identical estimates on failure frames
+# (0.249 / 0.255 / 0.252) -- they share one blind spot, so min aggregation
+# bought only +0.003 AUROC of failure discrimination and was a uniform shift
+# the quantile threshold absorbs anyway. The paper's "members diverge out of
+# distribution" premise did not hold on real failure states.
+#   Caveat kept honest: that evidence is about DISCRIMINATION. The paper's
+#   M=1 -> M=3 gain (+19.6) was downstream success rate, so if ensemble is to
+#   be declared unnecessary, a downstream run still has to show it.
+#
+# Usage (8 GPUs):
+#   bash examples/steam/process/run_compute_advantages_ensemble.sh \
+#       compute_advantages_steam2_bagging_4sku --nproc 8
+
+advantage:
+  # seed 7, trained 24000 steps on 12 sft + 1 dagger (dagger sampled at 5.7%).
+  value_checkpoint: /mnt/public/guqiuyi/RLinf_active/logs/steam_sft/steam2_model_bagging_4sku-20260823-22:46:22/steam2_bagging_4sku_dagger_hinge_seed7_k64/checkpoints/global_step_24000/actor
+
+  batch_size: 256
+  num_dataloader_workers_per_gpu: 12
+  prefetch_factor: 2
+
+  label_mode: quantile
+  # rollout pool: the DAgger set (see the type: rollout note below).
+  rollout_quantile: 0.6
+  # expert pool: the 12 demonstration sets, scored independently of the above.
+  expert_quantile: 0.8
+
+  tag: steam2_k32_dagger_hinge_ckpt24000
+
+  model:
+    precision: "bf16"
+
+data:
+  model_type: "pi0"
+  robot_type: "bagging_4sku_sm2sm"
+
+  # Inference lookahead: each frame t is paired with (t, t+k).
+  # NOT the same as the training-time data.k, which is the MAX sampled stride
+  # (uniform in [1, k]); this model was trained with max-stride 64. Project
+  # convention is train k=64 / label k=32.
+  k: 32
+
+  camera_keys:
+    - face_view
+    - left_wrist_view
+    - right_wrist_view
+
+  prompt: "[task]:Grasp the four items in the checkout area one by one, pass them through the scanner, put them into the paper bag, and finally lift the bag."
+
+  # Same corpus the value model was trained on: 12 expert sets + 1 DAgger set.
+  train_data_paths:
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0706+0707
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0708_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0714_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0715_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0717_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0724_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0730_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    # Despite the name this one holds takeover segments only, i.e. pure human
+    # teleop, so it is expert data and goes in the expert pool.
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0805_dagger
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0810
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0811_1_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0813_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0814_trimmed
+      robot_type: "bagging_4sku_sm2sm"
+      type: sft
+    # type: rollout, not dagger -- deliberate, matching the open_giftbox run.
+    # At LABELLING time the whole DAgger set goes through the rollout pool's
+    # quantile; "dagger" is a TRAINING-side type only. Routing the recovery
+    # segment into the expert pool instead is an open item (proposal 7.1) and
+    # needs segment-level types, which the script does not support yet.
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty0713_steam_dagger
+      robot_type: "bagging_4sku_sm2sm"
+      type: rollout
+
+distributed:
+  backend: "nccl"
+  timeout: 3600

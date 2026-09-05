@@ -40,31 +40,31 @@ data:
   # bagging_sku_zzc_0805_dagger 只含人工接管段（人类遥操=专家），同样计入专家池。
   # 合计 1106 episodes / 1,596,465 帧。
   train_data_paths:
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0706+0707
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0706+0707
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0708
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0708
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0714
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0714
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0715
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0715
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0717
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0717
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0724
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0724
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0805_dagger
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0805_dagger
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0813
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0813
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0814
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0814
       type: "sft"
       weight: 1.0
 

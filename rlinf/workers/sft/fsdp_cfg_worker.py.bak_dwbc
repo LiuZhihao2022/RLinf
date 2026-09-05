@@ -132,39 +132,6 @@ class FSDPCfgWorker(FSDPSftWorker):
         )
         return lookup
 
-    @staticmethod
-    def _load_weights_lookup(
-        data_path: str,
-        weight_tag: str,
-    ) -> dict[tuple[int, int], float]:
-        """Load per-frame DW-BC weights from meta/dwbc_weights_{tag}.parquet.
-
-        Same plumbing as the advantage lookup, but float weights produced by
-        examples/steam/process/compute_dwbc_weights.py (already normalized to
-        corpus mean 1). Used when data.weight_tag is set; the model must run
-        with openpi.algorithm == "dwbc" so these are treated as weights, not
-        boolean labels.
-        """
-        import pandas as pd
-
-        meta_path = Path(data_path) / "meta" / f"dwbc_weights_{weight_tag}.parquet"
-        if not meta_path.exists():
-            raise FileNotFoundError(
-                f"DW-BC weight file not found: {meta_path}. "
-                f"Run compute_dwbc_weights.py first."
-            )
-
-        w_df = pd.read_parquet(meta_path)
-        return dict(
-            zip(
-                zip(
-                    w_df["episode_index"].values.astype(int).tolist(),
-                    w_df["frame_index"].values.astype(int).tolist(),
-                ),
-                w_df["weight"].values.astype(float).tolist(),
-            )
-        )
-
     def build_dataloader(self):
         """Build CFG dataloader with advantage-weighted sampling across datasets."""
         import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
@@ -177,7 +144,6 @@ class FSDPCfgWorker(FSDPSftWorker):
         data_cfg = self.cfg.get("data", {})
         openpi_cfg = self.cfg.actor.model.openpi
         advantage_tag = data_cfg.get("advantage_tag", None)
-        weight_tag = data_cfg.get("weight_tag", None)
 
         datasets_config = data_cfg.get("train_data_paths", [])
         if not datasets_config:
@@ -245,19 +211,13 @@ class FSDPCfgWorker(FSDPSftWorker):
                 base_dataset, transforms_list
             )
 
-            if weight_tag:
-                advantages_lookup = self._load_weights_lookup(data_path, weight_tag)
-            else:
-                advantages_lookup = self._load_advantages_lookup(
-                    data_path, advantage_tag
-                )
+            advantages_lookup = self._load_advantages_lookup(data_path, advantage_tag)
             if self._rank == 0:
-                if weight_tag:
-                    adv_filename = f"dwbc_weights_{weight_tag}.parquet"
-                elif advantage_tag:
-                    adv_filename = f"advantages_{advantage_tag}.parquet"
-                else:
-                    adv_filename = "advantages.parquet"
+                adv_filename = (
+                    f"advantages_{advantage_tag}.parquet"
+                    if advantage_tag
+                    else "advantages.parquet"
+                )
                 self.log_info(
                     f"Loaded advantages from "
                     f"meta/{adv_filename} ({len(advantages_lookup)} entries)"

@@ -1,0 +1,138 @@
+# DW-BC(Difficulty-Weighted BC, proposal M11)— RoboDojo stack_bowls。
+#
+# 与 CFGRL 共用同一套管线(FSDPCfgWorker + OpenPi0ForCFGActionPrediction),
+# 两处开关切换算法:openpi.algorithm=dwbc + data.weight_tag。
+# 权重由 examples/steam/process/compute_dwbc_weights.py 离线算好
+# (w = (1 + d_s/d_avg) * max(A,0), 归一化到全语料均值 1),训练只做加权平均;
+# 不做条件化 —— 推理时它就是普通 pi0,与 BC 同构。
+#
+# Usage(16 卡 = 2 节点):
+#   cd /mnt/public/guqiuyi/RLinf_active
+#   export PATH=/mnt/public/guqiuyi/RLinf_qiuyi/.venv/bin:$PATH
+#   bash examples/steam/cfg/run_cfg_sft.sh robodojo_dwbc_openpi_steam2_stack_bowls
+#
+# 与真机 x2robot_cfg_openpi_steam2_bagging_4sku.yaml 的差别集中在三处:
+#   1. 关节空间 14 维 / 无主臂 / 无 state history  -> config_name + openpi_data
+#   2. action_horizon 50(真机 20)                  -> num_action_chunks
+#   3. 语料小 14 倍(13.7 万帧 vs 193 万)            -> max_steps
+
+defaults:
+  - model/pi0@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/sft/config/
+
+cluster:
+  num_nodes: 2 # 16卡用2，8卡用1（8卡时把 micro_batch_size 改成 32，保持 global 256）
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "steam2_dwbc_sft_robodojo_stack_bowls"
+    logger_backends: ["wandb"]
+  max_epochs: -1
+  # 语料 13.7 万帧(sft 4.5 万 + dagger 9.2 万), 是 bagging 的 1/14。
+  # bagging 的 90000 步 × 256 ≈ 12 个 epoch;这里同样步数会是 168 个 epoch。
+  # 取 30000 步 = 56 epoch, 与 BC(30000 步 × 128 = 86 epoch, 仅 sft)同量级,
+  # 便于与 BC 的成功率直接对比。save_interval 压到 5000 以便挑 ckpt。
+  max_steps: 30000
+  val_check_interval: -1
+  save_interval: 5000
+
+data:
+  num_workers: 8
+  # STEAM 2.0 value model(8000 步 ckpt)打的标:
+  #   专家侧校准误差 -0.003, 接管前 2s vs 远离接管 AUROC 0.865,
+  #   人接管段/恢复段的 A>0 比例 91.9%/92.5%, 接管前 22.9%。
+  # 推理 H=32(训练 k=64 的一半), 配对在人工接管处截断(clamp_at_takeover)。
+  # advantage_tag 是全局单值 —— 下面两份数据集必须都存在同名 parquet。
+  # DW-BC 走 weight_tag(读 meta/dwbc_weights_{tag}.parquet 的 float 权重);
+  # 设了它之后 advantage_tag 不再被读取。
+  weight_tag: dwbc_steam2_sb_k32_ckpt8000
+  balance_dataset_weights: true
+  seed: 42
+  # type 字段 CFG 侧不读取(只用 dataset_path / episodes / weight), 保留仅为溯源。
+  # 路径必须与 compute_advantages_steam2_stack_bowls.yaml 一致, 否则读不到 parquet。
+  # balance_dataset_weights=true 按帧数比例采样, dagger 自然占 67%。
+  train_data_paths:
+    - dataset_path: /mnt/resource/robodojo_dataset/lerobot/robodojo_stack_bowls_sft_ep100
+      type: "sft"
+      weight: 1.0
+      # 100 episodes / 44,774 frames
+    - dataset_path: /mnt/resource/robodojo_dataset/lerobot/robodojo_stack_bowls_dagger_ep175
+      type: "rollout"
+      weight: 1.0
+      # 175 episodes / 91,807 frames
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16 # 8卡用32，16卡用16
+  global_batch_size: 256
+  seed: 0
+  model:
+    precision: null
+    model_path: "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base_pytorch"
+    model_type: "cfg_model"
+    add_value_head: False
+    action_dim: 14            # RoboDojo 关节空间: 左臂6+左夹爪1+右臂6+右夹爪1
+    num_action_chunks: 50     # action_horizon=50, 与 BC 一致(执行 20 步后重规划)
+    openpi:
+      # 在 rlinf/models/embodiment/openpi/dataconfig/__init__.py 注册。
+      # ⚠️ 该 TrainConfig 里显式写了 assets=AssetsConfig(asset_id=...) ——
+      # 不写的话按 name 取配置时 asset_id 为 None, openpi/__init__.py 会在
+      # load_norm_stats 前 raise。norm_stats 需放在
+      #   {model_path}/robodojo_stack_bowls_sft_ep100/norm_stats.json
+      # (注意路径不含 assets/ 一级)。
+      config_name: "robodojo_stack_bowls"
+      algorithm: "dwbc"
+      # 下面几项在 dwbc 下不生效(不做条件化), 保留仅为与 CFGRL 配置逐行对齐:
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.0
+      train_expert_only: False
+      guidance_type: "positive"
+      positive_only_conditional: true
+    openpi_data:
+      # 仿真观测只有当前帧, 没有主臂也没有历史 —— 与真机的 3/2 不同。
+      state_history_size: 0
+      state_future_size: 0
+      state_step: 1
+  optim:
+    lr: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 1700     # 与 bagging 同比例(5000/90000 = 5.6%)
+    total_training_steps: 30000
+    min_lr: 0.0
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+critic:
+  use_critic_model: False

@@ -140,9 +140,7 @@ class CFGDataLoaderImpl(BaseDataLoaderImpl):
 
             advantage = batch["advantage"]
             if not isinstance(advantage, torch.Tensor):
-                # keep the incoming dtype: bool labels for CFGRL, float
-                # per-frame weights for DW-BC (data.weight_tag path)
-                advantage = torch.as_tensor(advantage)
+                advantage = torch.tensor(advantage, dtype=torch.bool)
 
             yield observation, actions, advantage
 

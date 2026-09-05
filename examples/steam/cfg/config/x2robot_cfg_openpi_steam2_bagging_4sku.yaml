@@ -21,7 +21,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "steam_cfg_sft_bagging_4sku"
+    experiment_name: "steam2_cfg_sft_bagging_4sku"
     logger_backends: ["wandb"]
   max_epochs: -1
   max_steps: 90000  # 总训练步数封顶；每 save_interval=3000 存一次，最终产出 global_step_90000
@@ -30,43 +30,75 @@ runner:
 
 data:
   num_workers: 8
-  # 从每个数据集读 meta/advantages_{tag}.parquet
-  # 这个 tag 是 relabel_advantages.py 用全局 expert_quantile=0.8 统一重标后的版本，
-  # 不是两半并行跑出来的 ..._raw（后者两半阈值不同，不可用）。
-  advantage_tag: steam_k32_ensemble3_ckpt16000_exp_only
+  # 从每个数据集读 meta/advantages_{tag}.parquet。
+  # STEAM 2.0：value model 训练时见过 DAgger 的失败段（hinge）与恢复段（当专家），
+  # 打标 k=32，推理配对在人工接管处截断（_tkclamp），
+  # rollout_quantile=0.3（原 0.6）/ expert_quantile=0.8。
+  # 阈值 +0.2445：失败段判正率 24.7% -> 1.1%，恢复段 lift 1.66 -> 3.22。
+  #
+  # advantage_tag 是全局单值，无法按数据集覆盖 —— 下面 13 份必须都存在同名 parquet。
+  advantage_tag: steam2_k32_dagger_hinge_ckpt24000_relabel_tkclamp
   balance_dataset_weights: true
   seed: 42
-  # 9 份全部是人类演示，故均为 sft。
-  # bagging_sku_zzc_0805_dagger 只含人工接管段（人类遥操=专家），同样计入专家池。
-  # 合计 1106 episodes / 1,596,465 帧。
+  # 12 份人类演示 + 1 份 DAgger。type 字段 CFG 侧不读取（只用 dataset_path /
+  # episodes / weight），保留仅为溯源。
+  # 路径必须与 compute_advantages_steam2_bagging_4sku_tkclamp.yaml 一致，否则读不到
+  # 对应的 advantages parquet —— 注意 sft 用的是 _trimmed 版本，与 STEAM 1.0 配置不同。
+  # 合计 1556 episodes / 1,927,124 帧；balance_dataset_weights=true 按帧数比例采样，
+  # DAgger 自然占 10.2%，无需额外 weight。
   train_data_paths:
     - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0706+0707
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0708
+      # 260 episodes / 368,689 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0708_trimmed
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0714
+      # 150 episodes / 210,779 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0714_trimmed
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0715
+      # 130 episodes / 202,917 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0715_trimmed
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0717
+      # 170 episodes / 261,559 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0717_trimmed
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0724
+      # 80 episodes / 116,532 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0724_trimmed
       type: "sft"
       weight: 1.0
+      # 62 episodes / 31,345 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0730_trimmed
+      type: "sft"
+      weight: 1.0
+      # 200 episodes / 109,101 frames
     - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0805_dagger
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0813
+      # 54 episodes / 12,861 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0810
       type: "sft"
       weight: 1.0
-    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0814
+      # 100 episodes / 20,974 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_zzc_0811_1_trimmed
       type: "sft"
       weight: 1.0
+      # 50 episodes / 19,079 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0813_trimmed
+      type: "sft"
+      weight: 1.0
+      # 60 episodes / 117,545 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0814_trimmed
+      type: "sft"
+      weight: 1.0
+      # 140 episodes / 259,763 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty0713_steam_dagger
+      type: "rollout"
+      weight: 1.0
+      # 100 episodes / 195,980 frames
 
 algorithm:
   adv_type: gae

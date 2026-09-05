@@ -1,0 +1,158 @@
+defaults:
+  - model/pi0@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/sft/config/
+
+cluster:
+  num_nodes: 2 # 16卡用2，8卡用1（8卡时把 micro_batch_size 改成 32，保持 global 256）
+  component_placement:
+    actor,env,rollout: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "steam2_cfg_sft_bagging_4sku"
+    logger_backends: ["wandb"]
+  max_epochs: -1
+  max_steps: 90000  # 总训练步数封顶；每 save_interval=3000 存一次，最终产出 global_step_90000
+  val_check_interval: -1
+  save_interval: 10000
+
+data:
+  num_workers: 8
+  # 从每个数据集读 meta/advantages_{tag}.parquet。
+  # STEAM 2.0：value model 训练时见过 DAgger 的失败段（hinge）与恢复段（当专家），
+  # 打标 k=32，推理配对在人工接管处截断（_tkclamp），
+  # rollout_quantile=0.3（原 0.6）/ expert_quantile=0.8。
+  # 阈值 +0.2445：失败段判正率 24.7% -> 1.1%，恢复段 lift 1.66 -> 3.22。
+  #
+  # advantage_tag 是全局单值，无法按数据集覆盖 —— 下面 13 份必须都存在同名 parquet。
+  advantage_tag: steam2_k32_dagger_hinge_ckpt24000_relabel_tkclamp
+  balance_dataset_weights: true
+  seed: 42
+  # 12 份人类演示 + 1 份 DAgger。type 字段 CFG 侧不读取（只用 dataset_path /
+  # episodes / weight），保留仅为溯源。
+  # 路径必须与 compute_advantages_steam2_bagging_4sku_tkclamp.yaml 一致，否则读不到
+  # 对应的 advantages parquet —— 注意 sft 用的是 _trimmed 版本，与 STEAM 1.0 配置不同。
+  # 合计 1556 episodes / 1,927,124 帧；balance_dataset_weights=true 按帧数比例采样，
+  # DAgger 自然占 10.2%，无需额外 weight。
+  train_data_paths:
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0706+0707
+      type: "sft"
+      weight: 1.0
+      # 260 episodes / 368,689 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0708_trimmed
+      type: "sft"
+      weight: 1.0
+      # 150 episodes / 210,779 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0714_trimmed
+      type: "sft"
+      weight: 1.0
+      # 130 episodes / 202,917 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0715_trimmed
+      type: "sft"
+      weight: 1.0
+      # 170 episodes / 261,559 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0717_trimmed
+      type: "sft"
+      weight: 1.0
+      # 80 episodes / 116,532 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0724_trimmed
+      type: "sft"
+      weight: 1.0
+      # 62 episodes / 31,345 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0730_trimmed
+      type: "sft"
+      weight: 1.0
+      # 200 episodes / 109,101 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0805_dagger
+      type: "sft"
+      weight: 1.0
+      # 54 episodes / 12,861 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0810
+      type: "sft"
+      weight: 1.0
+      # 100 episodes / 20,974 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_zzc_0811_1_trimmed
+      type: "sft"
+      weight: 1.0
+      # 50 episodes / 19,079 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0813_trimmed
+      type: "sft"
+      weight: 1.0
+      # 60 episodes / 117,545 frames
+    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0814_trimmed
+      type: "sft"
+      weight: 1.0
+      # 140 episodes / 259,763 frames
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty0713_steam_dagger
+      type: "rollout"
+      weight: 1.0
+      # 100 episodes / 195,980 frames
+
+algorithm:
+  adv_type: gae
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 16 # 8卡用32，16卡用16
+  global_batch_size: 256
+  seed: 0
+  model:
+    precision: null
+    model_path: "/mnt/public/datasets/pretrained-checkpoints/openpi-assets/checkpoints/pi0_base_pytorch"
+    model_type: "cfg_model"
+    add_value_head: False
+    action_dim: 28            # x2robot action dim
+    num_action_chunks: 20     # action_horizon=20
+    openpi:
+      # ⚠️ 该 TrainConfig 在 rlinf/models/embodiment/openpi/dataconfig/__init__.py:382
+      # 注册。它的 repo_id 目前仍是从 open_giftbox 复制来的，而 asset_id 默认取
+      # repo_id ⇒ 会加载 open_giftbox 的 norm_stats 来归一化 bagging 数据。
+      # 跑之前必须先加一行显式 asset_id（见对话记录），否则模型静默训错。
+      config_name: "bagging_4sku_sm2sm"
+      cfgrl_guidance_scale: 1.0
+      unconditional_prob: 0.1
+      train_expert_only: False
+      guidance_type: "positive"
+      positive_only_conditional: true
+    openpi_data:
+      state_history_size: 3
+      state_future_size: 2
+      state_step: 1
+  optim:
+    lr: 5.0e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    lr_scheduler: "cosine"
+    lr_warmup_steps: 5000
+    total_training_steps: 90000
+    min_lr: 0.0
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: True
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+critic:
+  use_critic_model: False

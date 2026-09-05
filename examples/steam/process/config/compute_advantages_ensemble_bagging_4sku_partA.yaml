@@ -86,13 +86,13 @@ data:
   # this deliberately differs from the open_giftbox convention, where the
   # DAgger set carried full autonomous rollouts and was tagged ``rollout``.
   train_data_paths:
-    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0706+0707
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0706+0707
       type: sft
-    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0714
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0714
       type: sft
-    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0813
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0813
       type: sft
-    - dataset_path: /mnt/public/gaojiahuan/huggingface/lerobot/bagging_sku_fty_0717
+    - dataset_path: /mnt/public/guqiuyi/huggingface/lerobot/bagging_sku_fty_0717
       type: sft
 
 distributed:

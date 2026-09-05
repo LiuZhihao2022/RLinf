@@ -138,12 +138,6 @@ ensemble_modeling_critic.EnsembleCriticOutput`, which is what the
     cat_acc_neighbor: Optional[torch.FloatTensor] = None
     mae: Optional[torch.FloatTensor] = None
     progress_values: Optional[torch.FloatTensor] = None
-    # DAgger 失败段诊断。混合语料下 `loss` 是 CE 与 hinge 的加权平均, 看不出
-    # hinge 约束到底满足了没有 —— 而这正是决定 DAgger 采样权重的量。
-    hinge_loss: Optional[torch.FloatTensor] = None
-    hinge_active_frac: Optional[torch.FloatTensor] = None
-    hinge_sample_frac: Optional[torch.FloatTensor] = None
-    ce_loss: Optional[torch.FloatTensor] = None
 
 
 class SteamCriticModel(nn.Module):
@@ -439,7 +433,6 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
 
         expert_loss = None
         cat_metrics = None
-        hinge_loss = hinge_active_frac = hinge_sample_frac = ce_loss = None
         if labels is not None:
             per_sample_ce, cat_metrics = self._compute_loss(logits, labels)
             if loss_mode is not None:
@@ -453,27 +446,6 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
                 )
                 is_hinge = lm == 1
                 expert_loss = torch.where(is_hinge, hinge, per_sample_ce)
-                # 这几个诊断量必须**无数据依赖分支**地算出来: 各 rank 的
-                # micro batch 里失败段样本数不同, 一旦用 `if n_hinge > 0`
-                # 之类的 Python 分支, 不同 rank 走不同算子路径, backward 的
-                # all-reduce 就对不上, FSDP 直接 hang 住 (实测会卡死)。
-                # 所以一律用 mask 求和 + clamp 分母, 所有 rank 执行同一串算子。
-                m_hinge = is_hinge.to(per_sample_ce.dtype)
-                m_ce = 1.0 - m_hinge
-                n_hinge = m_hinge.sum()
-                n_ce = m_ce.sum()
-                hinge_sample_frac = n_hinge / is_hinge.numel()
-                hinge_det = hinge.detach()
-                hinge_loss = (hinge_det * m_hinge).sum() / n_hinge.clamp(min=1.0)
-                # hinge 是单边约束: 一旦 E[b] <= -margin 梯度就是 0。所以
-                # 「还有多少失败段样本没满足约束」比 loss 值本身更能说明
-                # DAgger 信号是否已被吸收完。
-                hinge_active_frac = (
-                    (hinge_det > 0).to(per_sample_ce.dtype) * m_hinge
-                ).sum() / n_hinge.clamp(min=1.0)
-                ce_loss = (
-                    per_sample_ce.detach() * m_ce
-                ).sum() / n_ce.clamp(min=1.0)
             else:
                 expert_loss = per_sample_ce
 
@@ -492,10 +464,6 @@ ValueDataCollator`: ``images: dict[cam_name, Tensor[B,3,H,W]]`` in [0, 1],
             cat_acc_neighbor=cat_metrics["acc_neighbor"] if cat_metrics else None,
             mae=cat_metrics["mae"] if cat_metrics else None,
             progress_values=progress_values,
-            hinge_loss=hinge_loss,
-            hinge_active_frac=hinge_active_frac,
-            hinge_sample_frac=hinge_sample_frac,
-            ce_loss=ce_loss,
         )
 
     @torch.no_grad()
